@@ -1,0 +1,8 @@
+﻿# Country names this project could not resolve on its own.
+# Add a row for any name that shows up in outputs/unmatched_countries.csv
+# and really is a country. Columns: name,iso3
+#
+# Examples of what the program already knows (you do not need to repeat them):
+#   Soviet Union -> RUS, West Germany (FRG) -> DEU, Zaire -> COD,
+#   West Bank and Gaza Strip -> PSE, Ivory Coast -> CIV
+name,iso3
