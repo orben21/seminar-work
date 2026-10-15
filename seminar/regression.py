@@ -1,20 +1,25 @@
-"""The regressions, run independently for every metric.
+"""§7: the regressions.
 
-For each metric a ladder of nested models is estimated on exactly the same rows,
-so the models are directly comparable:
+The analysis is four regressions (§7.1), each run once per outcome (GDP
+growth for H1, the FDI ratio for H2) - eight in all:
 
-    A  before terrorism   metric ~ controls + country FE + year FE
-    B  after terrorism    metric ~ controls + terror + country FE + year FE
-    C  heterogeneity      B + terror x developed
-    D  long run           metric ~ controls + terror(t, t-1, ... t-k) + FE
+    1  pooled baseline          Y = b1 TSI(t) + b2 TSI(t-1) + g'X + mu_i + la_t + e
+    2  developed markets only   the same equation on the developed rows
+    3  developing markets only  the same equation on the developing rows
+    4  pooled with interaction  1 + b3 TSI(t) x DEV + b4 TSI(t-1) x DEV
 
-The A -> B difference is the headline: what terrorism adds once everything else
-is already accounted for.
+In regression 4 developing markets are the reference group: b1 is the effect
+there, b1 + b3 the effect in developed markets, and b3 - the difference - is
+the formal test of H1 and H2 (§7.3). DEV never enters alone: it is fixed per
+market, so the country fixed effects absorb it.
 
-Fixed effects are ordinary dummy variables (C(iso3), C(year)) rather than a
-specialised panel package. Country dummies absorb everything permanent about a
-country; year dummies absorb whatever hit the whole world that year. Standard
-errors are clustered by country, because a country's shocks persist across years.
+Around them, as §8 asks: the specification build-up (§8.4/§8.5), the
+component decomposition (§8.7) and the hypothesis-test summary (§8.8). Every
+regression of one outcome is estimated on the same rows and with the same
+standard-error type (§7.4 decides which).
+
+Fixed effects are dummy variables (C(iso3), C(year)). Coefficients on the TSI
+are per ONE STANDARD DEVIATION of terrorism severity in this sample (§5.6).
 """
 
 from __future__ import annotations
@@ -22,511 +27,403 @@ from __future__ import annotations
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
-from statsmodels.stats.outliers_influence import variance_inflation_factor
 
-from .panel import Panel
+from .panel import (COMPONENT_TERMS, INTERACTION, INTERACTION_LAG, TREATMENT,
+                    TREATMENT_LAG, Panel, complete_rows)
+from .tsi import COMPONENTS
 
-MODEL_NAMES = {
-    "A": "before terrorism",
-    "B": "after terrorism",
-    "C": "developed vs developing",
-    "D": "long run (distributed lag)",
+SE_CLUSTER = "cluster"
+SE_DRISCOLL_KRAAY = "driscoll_kraay"
+SE_LABELS = {SE_CLUSTER: "clustered by country",
+             SE_DRISCOLL_KRAAY: "Driscoll-Kraay"}
+
+CORE_TITLES = {
+    "1_pooled": "Regression 1 - pooled baseline",
+    "2_developed": "Regression 2 - developed markets only",
+    "3_developing": "Regression 3 - developing markets only",
+    "4_interaction": "Regression 4 - pooled with interaction",
 }
+# The plan's coefficient labels (§7.2-§7.3).
+BETA = {TREATMENT: "b1", TREATMENT_LAG: "b2", INTERACTION: "b3",
+        INTERACTION_LAG: "b4"}
 
 
 @dataclass
-class ModelFit:
+class Fit:
     key: str
-    name: str
+    title: str
+    outcome: str
+    sample: str
+    terms: List[str]
     formula: str
+    se_type: str
     n_obs: int
-    n_countries: int
+    n_markets: int
+    n_years: int
     r2: float
     r2_within: float
-    rss: float
     coefficients: pd.DataFrame
+    notes: List[str] = field(default_factory=list)
     result: object = field(repr=False, default=None)
 
-    def coef(self, term: str) -> Optional[float]:
-        row = self.coefficients[self.coefficients["term"] == term]
-        return None if row.empty else float(row["coef"].iloc[0])
+    def get(self, term: str) -> Optional[pd.Series]:
+        rows = self.coefficients[self.coefficients["term"] == term]
+        return None if rows.empty else rows.iloc[0]
+
+    def combination(self, terms: Sequence[str]) -> Dict[str, float]:
+        """Estimate, SE, p and 95% CI of a sum of coefficients."""
+        present = [t for t in terms if t in self.result.params.index]
+        if len(present) != len(terms):
+            return {}
+        test = self.result.t_test(" + ".join(present) + " = 0")
+        low, high = np.squeeze(test.conf_int())
+        return {"coef": float(np.squeeze(test.effect)),
+                "se": float(np.squeeze(test.sd)),
+                "p": float(np.squeeze(test.pvalue)),
+                "ci_low": float(low), "ci_high": float(high)}
+
+    def joint_test(self, terms: Sequence[str]) -> Dict[str, float]:
+        present = [t for t in terms if t in self.result.params.index]
+        if len(present) != len(terms):
+            return {}
+        test = self.result.wald_test(", ".join(f"{t} = 0" for t in present),
+                                     use_f=True, scalar=True)
+        return {"F": float(np.squeeze(test.statistic)),
+                "p": float(np.squeeze(test.pvalue)),
+                "df_num": float(test.df_num), "df_denom": float(test.df_denom)}
 
 
-@dataclass
-class MetricResult:
-    """Everything computed for one metric."""
-
-    metric: str
-    label: str
-    unit: str
-    terror_measure: str
-    n_obs: int
-    n_countries: int
-    year_min: int
-    year_max: int
-    models: Dict[str, ModelFit] = field(default_factory=dict)
-    comparison: Dict[str, float] = field(default_factory=dict)
-    control_shifts: pd.DataFrame = field(default_factory=pd.DataFrame)
-    group_effects: pd.DataFrame = field(default_factory=pd.DataFrame)
-    long_run: Dict[str, float] = field(default_factory=dict)
-    lag_profile: pd.DataFrame = field(default_factory=pd.DataFrame)
-    vif: pd.DataFrame = field(default_factory=pd.DataFrame)
-    diagnostics: Dict[str, float] = field(default_factory=dict)
-    interpretation: List[str] = field(default_factory=list)
-    notes: List[str] = field(default_factory=list)
-    skipped_reason: Optional[str] = None
-
-    @property
-    def ok(self) -> bool:
-        return self.skipped_reason is None
+def stars(p: float) -> str:
+    if p is None or not np.isfinite(p):
+        return ""
+    return "***" if p < 0.01 else "**" if p < 0.05 else "*" if p < 0.10 else ""
 
 
-# --------------------------------------------------------------------------
-# fitting helpers
-# --------------------------------------------------------------------------
+def dk_maxlags(n_periods: int) -> int:
+    """Newey-West rule floor(4 (T/100)^(2/9)), the usual Driscoll-Kraay lag."""
+    return max(1, int(math.floor(4 * (n_periods / 100) ** (2 / 9))))
 
-def _fit(formula: str, data: pd.DataFrame):
-    """OLS with country-clustered standard errors."""
+
+def _formula(outcome: str, terms: Sequence[str], country_fe: bool,
+             year_fe: bool) -> str:
+    parts = list(terms)
+    if country_fe:
+        parts.append("C(iso3)")
+    if year_fe:
+        parts.append("C(year)")
+    return f"{outcome} ~ " + (" + ".join(parts) if parts else "1")
+
+
+def _usable_terms(data: pd.DataFrame, terms: Sequence[str],
+                  notes: List[str]) -> List[str]:
+    """Drop regressors that cannot be estimated on these rows: constant, or
+    with no within-market variation (the country dummies absorb them)."""
+    kept = []
+    for term in terms:
+        column = data[term].astype(float)
+        if column.std(ddof=0) == 0:
+            notes.append(f"{term} is constant in this sample and was dropped")
+            continue
+        within = column.groupby(data["iso3"]).transform(lambda s: s - s.mean())
+        if within.abs().max() < 1e-12:
+            notes.append(f"{term} never varies within a market in this sample "
+                         f"and was dropped")
+            continue
+        kept.append(term)
+    return kept
+
+
+def fit_fe(data: pd.DataFrame, outcome: str, terms: Sequence[str],
+           se_type: str = SE_CLUSTER, country_fe: bool = True,
+           year_fe: bool = True, key: str = "", title: str = "",
+           sample: str = "all") -> Fit:
+    """OLS with country and/or year dummies and robust standard errors.
+
+    cluster          clustered by country; t-tests with G - 1 df
+    driscoll_kraay   robust to heteroskedasticity, serial correlation and
+                     cross-sectional dependence (Bartlett kernel, dk_maxlags
+                     lags); t-tests with T - 1 df, since the number of time
+                     periods is this estimator's effective sample size
+    """
+    data = data.sort_values(["iso3", "year"]).reset_index(drop=True)
+    notes: List[str] = []
+    terms = _usable_terms(data, terms, notes)
+    formula = _formula(outcome, terms, country_fe, year_fe)
+    n_years = int(data["year"].nunique())
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = smf.ols(formula, data=data)
-        return model.fit(cov_type="cluster",
-                         cov_kwds={"groups": data["iso3"]},
-                         use_t=True)
+        if se_type == SE_DRISCOLL_KRAAY:
+            codes = data["year"].map({y: i for i, y in enumerate(
+                sorted(data["year"].unique()))}).to_numpy()
+            result = model.fit(cov_type="hac-groupsum",
+                               cov_kwds={"time": codes,
+                                         "maxlags": dk_maxlags(n_years),
+                                         "use_correction": "hac"},
+                               use_t=True)
+            # set on the underlying results: on the wrapper statsmodels ignores it
+            result._results.df_resid_inference = n_years - 1
+        else:
+            groups = pd.factorize(data["iso3"])[0]
+            result = model.fit(cov_type="cluster",
+                               cov_kwds={"groups": groups}, use_t=True)
 
+        fe_only = _formula(outcome, [], country_fe, year_fe)
+        rss_fe = smf.ols(fe_only, data=data).fit().ssr
 
-def _two_way_demeaned(values: pd.Series, iso3: pd.Series,
-                      year: pd.Series) -> pd.Series:
-    """y minus country mean minus year mean plus grand mean."""
-    grand = values.mean()
-    by_country = values.groupby(iso3).transform("mean")
-    by_year = values.groupby(year).transform("mean")
-    return values - by_country - by_year + grand
-
-
-def _tidy(result, drop_fixed_effects: bool = True) -> pd.DataFrame:
-    """Coefficients as a flat table, with the hundreds of dummies left out."""
-    table = pd.DataFrame({
-        "term": result.params.index,
-        "coef": result.params.values,
-        "se": result.bse.values,
-        "t": result.tvalues.values,
-        "p": result.pvalues.values,
-    })
     conf = result.conf_int()
-    table["ci_low"] = conf.iloc[:, 0].values
-    table["ci_high"] = conf.iloc[:, 1].values
-    if drop_fixed_effects:
-        is_dummy = table["term"].str.startswith(("C(iso3)", "C(year)"))
-        table = table[~is_dummy]
-    table["stars"] = table["p"].map(_stars)
-    return table.reset_index(drop=True)
-
-
-def _stars(p: float) -> str:
-    if not np.isfinite(p):
-        return ""
-    if p < 0.01:
-        return "***"
-    if p < 0.05:
-        return "**"
-    if p < 0.10:
-        return "*"
-    return ""
-
-
-def _wald_p(result, terms: List[str]) -> Optional[float]:
-    """Joint significance of `terms`, using the clustered covariance."""
-    present = [t for t in terms if t in result.params.index]
-    if not present:
-        return None
-    restriction = ", ".join(f"{t} = 0" for t in present)
-    try:
-        test = result.wald_test(restriction, use_f=True, scalar=True)
-        return float(np.squeeze(test.pvalue))
-    except Exception:
-        return None
-
-
-def _formula(metric: str, terms: List[str], fixed_effects: bool = True) -> str:
-    parts = list(terms)
-    if fixed_effects:
-        parts += ["C(iso3)", "C(year)"]
-    right = " + ".join(parts) if parts else "1"
-    return f"{metric} ~ {right}"
-
-
-# --------------------------------------------------------------------------
-# the main entry point
-# --------------------------------------------------------------------------
-
-def analyse_metric(panel: Panel, terror_measure: str,
-                   lags: List[int]) -> MetricResult:
-    """Run the whole model ladder for one metric."""
-    if not panel.ok:
-        return MetricResult(metric=panel.metric, label=panel.label,
-                            unit=panel.unit, terror_measure=terror_measure,
-                            n_obs=0, n_countries=0, year_min=0, year_max=0,
-                            skipped_reason=panel.skipped_reason)
-
-    data = panel.data
-    metric = panel.metric
-    controls = panel.control_columns
-
-    result = MetricResult(
-        metric=metric, label=panel.label, unit=panel.unit,
-        terror_measure=terror_measure, n_obs=len(data),
-        n_countries=data["iso3"].nunique(),
-        year_min=int(data["year"].min()), year_max=int(data["year"].max()),
-        notes=list(panel.notes),
-    )
-
-    demeaned = _two_way_demeaned(data[metric], data["iso3"], data["year"])
-    total_within = float((demeaned ** 2).sum())
-
-    def build(key: str, terms: List[str]) -> ModelFit:
-        formula = _formula(metric, terms)
-        fitted = _fit(formula, data)
-        rss = float(np.sum(fitted.resid ** 2))
-        return ModelFit(
-            key=key, name=MODEL_NAMES[key], formula=formula,
-            n_obs=int(fitted.nobs), n_countries=data["iso3"].nunique(),
-            r2=float(fitted.rsquared), rss=rss,
-            r2_within=1.0 - rss / total_within if total_within > 0 else np.nan,
-            coefficients=_tidy(fitted), result=fitted,
-        )
-
-    # ---- A: before terrorism, B: after terrorism -------------------------
-    model_a = build("A", controls)
-    model_b = build("B", controls + ["terror"])
-    result.models["A"] = model_a
-    result.models["B"] = model_b
-    result.comparison = _compare(model_a, model_b, data, metric)
-    result.control_shifts = _control_shifts(model_a, model_b, controls)
-
-    # ---- C: does the effect differ by group? -----------------------------
-    developed_varies = _varies_within_country(data, "developed")
-    hetero_terms = controls + ["terror", "terror_x_developed"]
-    if developed_varies:
-        hetero_terms.insert(-1, "developed")
-    else:
-        result.notes.append(
-            "the 'developed' main effect is absorbed by the country fixed "
-            "effects (each country stays in one group), so only the "
-            "interaction is estimated - it measures the difference in slope")
-    if data["developed"].nunique() > 1:
-        model_c = build("C", hetero_terms)
-        result.models["C"] = model_c
-        result.group_effects = _group_effects(model_c)
-    else:
-        result.notes.append("only one group is present, so the "
-                            "developed/developing comparison was not estimated")
-
-    # ---- D: the long run -------------------------------------------------
-    if len(panel.lag_columns) > 1:
-        model_d = build("D", controls + panel.lag_columns)
-        result.models["D"] = model_d
-        result.long_run = _long_run(model_d, panel.lag_columns)
-        result.lag_profile = _lag_profile(model_d, panel.lag_columns, lags)
-
-    result.vif = _vif(data, controls + ["terror"])
-    result.diagnostics = _diagnostics(model_b, data, metric)
-    result.interpretation = _interpret(result, data, terror_measure)
-    return result
-
-
-def _compare(model_a: ModelFit, model_b: ModelFit,
-             data: pd.DataFrame, metric: str) -> Dict[str, float]:
-    """What the terrorism variable added, on identical rows."""
-    terror = model_b.coefficients[model_b.coefficients["term"] == "terror"]
-    p_value = _wald_p(model_b.result, ["terror"])
-    partial_r2 = ((model_a.rss - model_b.rss) / model_a.rss
-                  if model_a.rss > 0 else np.nan)
-    return {
-        "r2_before": model_a.r2,
-        "r2_after": model_b.r2,
-        "r2_gain": model_b.r2 - model_a.r2,
-        "r2_within_before": model_a.r2_within,
-        "r2_within_after": model_b.r2_within,
-        "r2_within_gain": model_b.r2_within - model_a.r2_within,
-        "partial_r2": partial_r2,
-        "terror_coef": float(terror["coef"].iloc[0]) if len(terror) else np.nan,
-        "terror_se": float(terror["se"].iloc[0]) if len(terror) else np.nan,
-        "terror_ci_low": float(terror["ci_low"].iloc[0]) if len(terror) else np.nan,
-        "terror_ci_high": float(terror["ci_high"].iloc[0]) if len(terror) else np.nan,
-        "terror_p": p_value if p_value is not None else np.nan,
-        "terror_sd": float(data["terror"].std(ddof=1)),
-        "metric_sd": float(data[metric].std(ddof=1)),
-    }
-
-
-def _control_shifts(model_a: ModelFit, model_b: ModelFit,
-                    controls: List[str]) -> pd.DataFrame:
-    """How each control's coefficient moved once terrorism entered."""
-    rows = []
-    for control in controls:
-        before = model_a.coef(control)
-        after = model_b.coef(control)
-        if before is None or after is None:
-            continue
-        rows.append({
-            "term": control,
-            "coef_before": before,
-            "coef_after": after,
-            "change": after - before,
-            "pct_change": (after - before) / abs(before) * 100
-            if before not in (0, None) else np.nan,
-        })
-    return pd.DataFrame(rows)
-
-
-def _varies_within_country(data: pd.DataFrame, column: str) -> bool:
-    return bool((data.groupby("iso3")[column].nunique() > 1).any())
-
-
-def _group_effects(model_c: ModelFit) -> pd.DataFrame:
-    """Terrorism's slope for developing (base) and for developed countries."""
-    result = model_c.result
-    rows = []
-
-    base = model_c.coefficients[model_c.coefficients["term"] == "terror"]
-    if len(base):
-        row = base.iloc[0]
-        rows.append({"group": "developing", "coef": row["coef"],
-                     "se": row["se"], "p": row["p"],
-                     "ci_low": row["ci_low"], "ci_high": row["ci_high"]})
-
-    if {"terror", "terror_x_developed"} <= set(result.params.index):
-        try:
-            test = result.t_test("terror + terror_x_developed = 0")
-            conf = np.squeeze(test.conf_int())
-            rows.append({"group": "developed",
-                         "coef": float(np.squeeze(test.effect)),
-                         "se": float(np.squeeze(test.sd)),
-                         "p": float(np.squeeze(test.pvalue)),
-                         "ci_low": float(conf[0]), "ci_high": float(conf[1])})
-        except Exception:
-            pass
-
-    interaction = model_c.coefficients[
-        model_c.coefficients["term"] == "terror_x_developed"]
-    if len(interaction):
-        row = interaction.iloc[0]
-        rows.append({"group": "difference (developed - developing)",
-                     "coef": row["coef"], "se": row["se"], "p": row["p"],
-                     "ci_low": row["ci_low"], "ci_high": row["ci_high"]})
-
-    table = pd.DataFrame(rows)
-    if not table.empty:
-        table["stars"] = table["p"].map(_stars)
-    return table
-
-
-def _long_run(model_d: ModelFit, lag_columns: List[str]) -> Dict[str, float]:
-    """The cumulative effect: the sum of the coefficients across all lags."""
-    result = model_d.result
-    present = [c for c in lag_columns if c in result.params.index]
-    if not present:
-        return {}
-    try:
-        test = result.t_test(" + ".join(present) + " = 0")
-        conf = np.squeeze(test.conf_int())
-        return {
-            "cumulative": float(np.squeeze(test.effect)),
-            "se": float(np.squeeze(test.sd)),
-            "p": float(np.squeeze(test.pvalue)),
-            "ci_low": float(conf[0]),
-            "ci_high": float(conf[1]),
-            "joint_p": _wald_p(result, present) or np.nan,
-            "n_lags": len(present),
-        }
-    except Exception:
-        return {}
-
-
-def _lag_profile(model_d: ModelFit, lag_columns: List[str],
-                 lags: List[int]) -> pd.DataFrame:
-    """Effect at each lag, plus the running cumulative effect and its CI."""
-    result = model_d.result
-    rows = []
-    for lag, column in zip(lags, lag_columns):
-        row = model_d.coefficients[model_d.coefficients["term"] == column]
-        if row.empty:
-            continue
-        row = row.iloc[0]
-        so_far = [c for c in lag_columns[:lag_columns.index(column) + 1]
-                  if c in result.params.index]
-        cumulative = cumulative_low = cumulative_high = np.nan
-        try:
-            test = result.t_test(" + ".join(so_far) + " = 0")
-            conf = np.squeeze(test.conf_int())
-            cumulative = float(np.squeeze(test.effect))
-            cumulative_low, cumulative_high = float(conf[0]), float(conf[1])
-        except Exception:
-            pass
-        rows.append({
-            "lag": lag, "term": column,
-            "coef": row["coef"], "se": row["se"], "p": row["p"],
-            "ci_low": row["ci_low"], "ci_high": row["ci_high"],
-            "cumulative": cumulative,
-            "cumulative_ci_low": cumulative_low,
-            "cumulative_ci_high": cumulative_high,
-        })
-    return pd.DataFrame(rows)
-
-
-def _vif(data: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
-    """Multicollinearity among the regressors that are not fixed effects."""
-    usable = [c for c in columns if c in data.columns
-              and data[c].std(ddof=0) > 0]
-    if len(usable) < 2:
-        return pd.DataFrame()
-    matrix = data[usable].astype(float).copy()
-    matrix.insert(0, "const", 1.0)
-    rows = []
-    for position, column in enumerate(matrix.columns):
-        if column == "const":
-            continue
-        try:
-            value = variance_inflation_factor(matrix.values, position)
-        except Exception:
-            value = np.nan
-        rows.append({"term": column, "vif": value})
-    return pd.DataFrame(rows)
-
-
-def _diagnostics(model_b: ModelFit, data: pd.DataFrame,
-                 metric: str) -> Dict[str, float]:
-    result = model_b.result
-    country_terms = [t for t in result.params.index if t.startswith("C(iso3)")]
-    year_terms = [t for t in result.params.index if t.startswith("C(year)")]
-    return {
-        "n_obs": float(len(data)),
-        "n_countries": float(data["iso3"].nunique()),
-        "n_years": float(data["year"].nunique()),
-        "country_fe_p": _wald_p(result, country_terms) or np.nan,
-        "year_fe_p": _wald_p(result, year_terms) or np.nan,
-        "metric_mean": float(data[metric].mean()),
-        "metric_sd": float(data[metric].std(ddof=1)),
-        "terror_mean": float(data["terror"].mean()),
-        "terror_share_nonzero": float((data["terror"] > 0).mean()),
-    }
-
-
-def _interpret(result: MetricResult, data: pd.DataFrame,
-               terror_measure: str) -> List[str]:
-    """Plain-language readings of the numbers, for the report."""
-    lines = []
-    comparison = result.comparison
-    coefficient = comparison.get("terror_coef", np.nan)
-    p_value = comparison.get("terror_p", np.nan)
-    unit = result.unit or "units"
-
-    if not np.isfinite(coefficient):
-        return lines
-
-    direction = "lower" if coefficient < 0 else "higher"
-    significance = ("statistically significant at 5%"
-                    if np.isfinite(p_value) and p_value < 0.05
-                    else "not statistically significant at 5%")
-
-    if terror_measure.startswith("log"):
-        per_tenfold = coefficient * math.log(10)
-        lines.append(
-            f"A tenfold increase in {terror_measure.replace('log_', '')} is "
-            f"associated with {abs(per_tenfold):.3g} {unit} {direction} "
-            f"{result.label} ({significance}).")
-    else:
-        lines.append(
-            f"One more unit of {terror_measure} is associated with "
-            f"{abs(coefficient):.3g} {unit} {direction} {result.label} "
-            f"({significance}).")
-
-    terror_sd = comparison.get("terror_sd", np.nan)
-    if np.isfinite(terror_sd) and terror_sd > 0:
-        lines.append(
-            f"A one standard deviation increase in terrorism "
-            f"({terror_sd:.2f}) moves {result.label} by "
-            f"{coefficient * terror_sd:+.3g} {unit}.")
-
-    gain = comparison.get("r2_within_gain", np.nan)
-    if np.isfinite(gain):
-        lines.append(
-            f"Adding terrorism raised the within-country R2 from "
-            f"{comparison['r2_within_before']:.3f} to "
-            f"{comparison['r2_within_after']:.3f} "
-            f"(+{gain:.4f}).")
-
-    if not result.group_effects.empty:
-        table = result.group_effects.set_index("group")
-        if "difference (developed - developing)" in table.index:
-            row = table.loc["difference (developed - developing)"]
-            verdict = ("differs significantly" if row["p"] < 0.05
-                       else "does not differ significantly")
-            lines.append(
-                f"The effect in developed countries {verdict} from developing "
-                f"countries (difference {row['coef']:+.3g}, p={row['p']:.3f}).")
-
-    if result.long_run:
-        long_run = result.long_run
-        lines.append(
-            f"Cumulated over {long_run['n_lags']} years the effect is "
-            f"{long_run['cumulative']:+.3g} {unit} "
-            f"(p={long_run['p']:.3f}), against {coefficient:+.3g} in the "
-            f"first year alone.")
-
-    return lines
-
-
-def partial_regression_frame(panel: Panel) -> pd.DataFrame:
-    """Data for the added-variable plot: the isolated terrorism effect.
-
-    Both the metric and terrorism are stripped of everything the controls and
-    the fixed effects already explain; what is left is the relationship the
-    coefficient actually measures. The slope through these residuals equals the
-    regression coefficient on terrorism.
-    """
-    data = panel.data
-    controls = panel.control_columns
-
-    metric_resid = _fit(_formula(panel.metric, controls), data).resid
-    terror_resid = _fit(_formula("terror", controls), data).resid
-
-    return pd.DataFrame({
-        "iso3": data["iso3"].values,
-        "year": data["year"].values,
-        "group": data["group"].values,
-        "terror_resid": np.asarray(terror_resid),
-        "metric_resid": np.asarray(metric_resid),
+    table = pd.DataFrame({
+        "term": result.params.index, "coef": result.params.values,
+        "se": result.bse.values, "t": result.tvalues.values,
+        "p": result.pvalues.values, "ci_low": conf.iloc[:, 0].values,
+        "ci_high": conf.iloc[:, 1].values,
     })
+    table = table[~table["term"].str.startswith(("C(iso3)", "C(year)"))]
+    table["stars"] = table["p"].map(stars)
+    table["beta"] = table["term"].map(BETA).fillna("")
+
+    n_markets = int(data["iso3"].nunique())
+    if se_type == SE_CLUSTER and n_markets < 20:
+        notes.append(f"only {n_markets} clusters: clustered standard errors "
+                     f"may be too small")
+    return Fit(key=key, title=title, outcome=outcome, sample=sample,
+               terms=list(terms), formula=formula, se_type=se_type,
+               n_obs=int(result.nobs), n_markets=n_markets, n_years=n_years,
+               r2=float(result.rsquared),
+               r2_within=float(1 - result.ssr / rss_fe) if rss_fe > 0
+               else np.nan,
+               coefficients=table.reset_index(drop=True), notes=notes,
+               result=result)
 
 
-def run_all(panels: Dict[str, Panel], terror_measure: str,
-            lags: List[int]) -> Dict[str, MetricResult]:
-    """Analyse every metric independently. A failure is recorded, not raised."""
-    results = {}
-    for name, panel in panels.items():
-        if not panel.ok:
-            results[name] = analyse_metric(panel, terror_measure, lags)
-            print(f"  {name}: SKIPPED - {panel.skipped_reason}")
+# --------------------------------------------------------------------------
+# the four regressions of §7.1
+# --------------------------------------------------------------------------
+
+def estimation_sample(panel: Panel, outcome: str,
+                      extra: Sequence[str] = ()) -> pd.DataFrame:
+    """Rows with the outcome, TSI(t), TSI(t-1), the group and every control.
+    The first window year drops out: its lag lies before the window."""
+    columns = ([outcome, TREATMENT, TREATMENT_LAG, "developed"]
+               + panel.control_names + list(extra))
+    return complete_rows(panel.data, columns)
+
+
+def core_regressions(panel: Panel, outcome: str, se_type: str,
+                     exclude: Sequence[str] = ()) -> Dict[str, Fit]:
+    """Regressions 1-4 for one outcome, on one common set of rows."""
+    base = estimation_sample(panel, outcome)
+    if exclude:
+        base = base[~base["iso3"].isin(exclude)].reset_index(drop=True)
+    controls = panel.control_names
+    fits = {}
+    fits["1_pooled"] = fit_fe(base, outcome,
+                              [TREATMENT, TREATMENT_LAG] + controls, se_type,
+                              key="1_pooled", title=CORE_TITLES["1_pooled"])
+    for key, flag, sample in (("2_developed", 1.0, "developed"),
+                              ("3_developing", 0.0, "developing")):
+        rows = base[base["developed"] == flag]
+        if rows["iso3"].nunique() < 2:
             continue
-        try:
-            results[name] = analyse_metric(panel, terror_measure, lags)
-            comparison = results[name].comparison
-            print(f"  {name}: terror coef {comparison['terror_coef']:+.4g} "
-                  f"(p={comparison['terror_p']:.3f}), "
-                  f"within-R2 {comparison['r2_within_before']:.3f} -> "
-                  f"{comparison['r2_within_after']:.3f}")
-        except Exception as error:                       # keep the run alive
-            results[name] = MetricResult(
-                metric=name, label=panel.label, unit=panel.unit,
-                terror_measure=terror_measure, n_obs=panel.n_obs,
-                n_countries=panel.n_countries, year_min=0, year_max=0,
-                skipped_reason=f"regression failed: {error}")
-            print(f"  {name}: FAILED - {error}")
-    return results
+        fits[key] = fit_fe(rows, outcome, [TREATMENT, TREATMENT_LAG] + controls,
+                           se_type, key=key, title=CORE_TITLES[key],
+                           sample=sample)
+    if base["developed"].nunique() == 2:
+        fits["4_interaction"] = fit_fe(
+            base, outcome,
+            [TREATMENT, TREATMENT_LAG, INTERACTION, INTERACTION_LAG] + controls,
+            se_type, key="4_interaction", title=CORE_TITLES["4_interaction"])
+    return fits
+
+
+def marginal_effects(fit4: Fit) -> pd.DataFrame:
+    """§8.6 / Figure 22: the effect inside each group, and the difference."""
+    rows = []
+    for horizon, own, inter in (("t", TREATMENT, INTERACTION),
+                                ("t-1", TREATMENT_LAG, INTERACTION_LAG)):
+        for group, terms in (("developing", [own]),
+                             ("developed", [own, inter]),
+                             ("difference (developed - developing)", [inter])):
+            estimate = fit4.combination(terms)
+            if estimate:
+                rows.append({"outcome": fit4.outcome, "horizon": horizon,
+                             "group": group,
+                             "combination": " + ".join(BETA[t] for t in terms),
+                             **estimate, "stars": stars(estimate["p"])})
+    return pd.DataFrame(rows)
+
+
+def buildup(panel: Panel, outcome: str, se_type: str) -> List[Fit]:
+    """§8.4 / §8.5: TSI only, + controls, + year FE, + lag - on the rows of
+    regression 1, so the columns differ in specification and nothing else.
+    Country fixed effects are in every column (the empirical strategy of §7.1).
+    """
+    base = estimation_sample(panel, outcome)
+    controls = panel.control_names
+    columns = [
+        ("(1) TSI only", [TREATMENT], False),
+        ("(2) + controls", [TREATMENT] + controls, False),
+        ("(3) + year FE", [TREATMENT] + controls, True),
+        ("(4) + lag", [TREATMENT, TREATMENT_LAG] + controls, True),
+    ]
+    return [fit_fe(base, outcome, terms, se_type, year_fe=year_fe,
+                   key=f"buildup_{index}", title=title)
+            for index, (title, terms, year_fe) in enumerate(columns, start=1)]
+
+
+def component_regressions(panel: Panel, outcome: str, se_type: str,
+                          mode: str = "separate") -> List[Fit]:
+    """§8.7: the four components in place of the composite.
+
+    separate  one regression per component: z(ln(1+x)) at t and t-1 replace
+              TSI(t) and TSI(t-1). Each coefficient is on the same one-SD
+              scale as the component enters the TSI.
+    joint     all four components (and lags) in one regression. They are
+              strongly correlated, so read the VIFs before the coefficients.
+    """
+    lags = [f"{term}_lag1" for term in COMPONENT_TERMS]
+    base = estimation_sample(panel, outcome, extra=COMPONENT_TERMS + lags)
+    controls = panel.control_names
+    samples = [("all", base), ("developed", base[base["developed"] == 1.0]),
+               ("developing", base[base["developed"] == 0.0])]
+    fits = []
+    for sample, rows in samples:
+        if rows["iso3"].nunique() < 2:
+            continue
+        if mode == "joint":
+            fits.append(fit_fe(rows, outcome, COMPONENT_TERMS + lags + controls,
+                               se_type, key=f"components_{sample}",
+                               title="all four components", sample=sample))
+            continue
+        for component, term in zip(COMPONENTS, COMPONENT_TERMS):
+            fits.append(fit_fe(rows, outcome, [term, f"{term}_lag1"]
+                               + controls, se_type,
+                               key=f"component_{component}_{sample}",
+                               title=f"{component} in place of the TSI",
+                               sample=sample))
+    return fits
+
+
+def component_table(fits: List[Fit]) -> pd.DataFrame:
+    rows = []
+    for fit in fits:
+        for component, term in zip(COMPONENTS, COMPONENT_TERMS):
+            for horizon, name in (("t", term), ("t-1", f"{term}_lag1")):
+                row = fit.get(name)
+                if row is None:
+                    continue
+                rows.append({"outcome": fit.outcome, "sample": fit.sample,
+                             "component": component, "horizon": horizon,
+                             "coef": row["coef"], "se": row["se"],
+                             "p": row["p"], "ci_low": row["ci_low"],
+                             "ci_high": row["ci_high"], "stars": row["stars"],
+                             "n_obs": fit.n_obs, "specification": fit.title})
+    return pd.DataFrame(rows)
+
+
+# --------------------------------------------------------------------------
+# tables for §8
+# --------------------------------------------------------------------------
+
+def coefficient_columns(fits: List[Fit], terms: Sequence[str]) -> pd.DataFrame:
+    """A regression table: one column per fit, coef (se) stars per term,
+    then N, markets, R2 and within R2."""
+    table = {}
+    for fit in fits:
+        cells = {}
+        for term in terms:
+            row = fit.get(term)
+            cells[term] = ("" if row is None else
+                           f"{row['coef']:.3f}{row['stars']} ({row['se']:.3f})")
+        cells["observations"] = f"{fit.n_obs:,}"
+        cells["markets"] = str(fit.n_markets)
+        cells["years"] = str(fit.n_years)
+        cells["R2"] = f"{fit.r2:.3f}"
+        cells["within R2"] = f"{fit.r2_within:.3f}"
+        cells["country FE"] = "yes" if "C(iso3)" in fit.formula else "no"
+        cells["year FE"] = "yes" if "C(year)" in fit.formula else "no"
+        cells["SE"] = SE_LABELS[fit.se_type]
+        table[fit.title] = cells
+    frame = pd.DataFrame(table)
+    frame.index.name = "term"
+    return frame.reset_index()
+
+
+def core_terms(panel: Panel) -> List[str]:
+    return [TREATMENT, TREATMENT_LAG, INTERACTION, INTERACTION_LAG] \
+        + panel.control_names
+
+
+def hypothesis_tests(core: Dict[str, Dict[str, Fit]],
+                     hypotheses: Dict[str, str],
+                     alpha: float = 0.05) -> pd.DataFrame:
+    """§8.8: hypothesis, specification, coefficient, SE, p, decision."""
+    rows = []
+    for outcome, fits in core.items():
+        fit = fits.get("4_interaction")
+        if fit is None:
+            continue
+        hypothesis = hypotheses[outcome]
+        for term, label in ((INTERACTION, "b3: TSI(t) x Developed"),
+                            (INTERACTION_LAG, "b4: TSI(t-1) x Developed")):
+            row = fit.get(term)
+            if row is None:
+                continue
+            reject = row["p"] < alpha
+            rows.append({
+                "hypothesis": hypothesis, "outcome": outcome,
+                "specification": fit.title, "quantity": label,
+                "coef": row["coef"], "se": row["se"], "p": row["p"],
+                "decision": (f"reject H0 ({label.split(':')[0]} = 0) at "
+                             f"{alpha:.0%}" if reject else
+                             f"do not reject H0 ({label.split(':')[0]} = 0)"),
+            })
+        joint = fit.joint_test([INTERACTION, INTERACTION_LAG])
+        if joint:
+            rows.append({
+                "hypothesis": hypothesis, "outcome": outcome,
+                "specification": fit.title,
+                "quantity": "b3 = b4 = 0 (differ at any horizon)",
+                "coef": np.nan, "se": np.nan, "p": joint["p"],
+                "F": joint["F"],
+                "decision": ("reject H0 (b3 = b4 = 0)" if joint["p"] < alpha
+                             else "do not reject H0 (b3 = b4 = 0)"),
+            })
+        base = fit.get(TREATMENT)
+        if base is not None:
+            rows.append({
+                "hypothesis": hypothesis, "outcome": outcome,
+                "specification": fit.title,
+                "quantity": "b1: TSI(t) in developing markets (reference)",
+                "coef": base["coef"], "se": base["se"], "p": base["p"],
+                "decision": "reported alongside (Part 0.4)",
+            })
+    return pd.DataFrame(rows)
+
+
+def all_coefficients(fits: List[Fit]) -> pd.DataFrame:
+    """Appendix D: every non-dummy coefficient of every regression."""
+    frames = []
+    for fit in fits:
+        table = fit.coefficients.copy()
+        table.insert(0, "sample", fit.sample)
+        table.insert(0, "specification", fit.title)
+        table.insert(0, "outcome", fit.outcome)
+        frames.append(table)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def model_table(fits: List[Fit]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "outcome": fit.outcome, "specification": fit.title,
+        "sample": fit.sample, "n_obs": fit.n_obs, "markets": fit.n_markets,
+        "years": fit.n_years, "r2": fit.r2, "r2_within": fit.r2_within,
+        "se": SE_LABELS[fit.se_type], "formula": fit.formula,
+        "notes": "; ".join(fit.notes),
+    } for fit in fits])

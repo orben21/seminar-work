@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pandas as pd
 
-from seminar import filters, io_tabular, terror
-from seminar.specs import ControlSpec, FilterSpec, MetricSpec
+from seminar import io_tabular
+from seminar.specs import ControlSpec
 
 PASSED = []
 FAILED = []
@@ -109,8 +109,8 @@ def test_clear_errors(directory):
 
     path = write(directory, "badcol.csv", "country,year,value\nUSA,1990,1\n")
     try:
-        io_tabular.load_table(path, "x", MetricSpec(file="badcol.csv",
-                                                    column="wrong_name"))
+        io_tabular.load_table(path, "x", ControlSpec(file="badcol.csv",
+                                                     column="wrong_name"))
         check("wrong column name raises a clear error", False)
     except io_tabular.DataFileError as error:
         check("wrong column name raises a clear error",
@@ -127,50 +127,13 @@ def test_transforms(directory):
     logged = io_tabular.apply_transform(table.copy(), "x", "log")
     check("log transform applied",
           abs(float(logged["x"].iloc[0]) - 4.605170) < 1e-5)
-
-
-def test_threshold_filter(directory):
-    path = write(directory, "gni.csv",
-                 "country,year,value\n"
-                 "USA,1990,40000\nUSA,1991,42000\n"
-                 "IND,1990,500\nIND,1991,600\n")
-    spec = FilterSpec(file="gni.csv", column="value", rule="threshold",
-                      threshold=13935, mode="static")
-    table = filters.build_classification(spec, "gni", (1990, 1991), directory)
-    tags = table.drop_duplicates("iso3").set_index("iso3")["group"]
-    check("threshold classifies both sides",
-          tags["USA"] == "developed" and tags["IND"] == "developing")
-    check("static mode gives one row per country-year", len(table) == 4)
-
-    impossible = FilterSpec(file="gni.csv", column="value", rule="threshold",
-                            threshold=10 ** 9, mode="static")
-    try:
-        filters.build_classification(impossible, "gni", (1990, 1991), directory)
-        check("impossible threshold is caught", False)
-    except filters.FilterError as error:
-        check("impossible threshold is caught",
-              "above every value" in str(error))
-
-
-def test_terror_1993_stays_missing():
-    """The GTD lost 1993; it must never enter as a year of zero attacks."""
-    country_year = pd.DataFrame({
-        "iso3": ["USA", "USA"], "year": [1992, 1994],
-        "n_attacks": [5.0, 7.0], "n_attacks_success": [4.0, 6.0],
-        "n_attacks_lethal": [1.0, 2.0], "n_attacks_suicide": [0.0, 0.0],
-        "n_killed": [3.0, 9.0], "n_wounded": [2.0, 4.0],
-        "n_casualties": [5.0, 13.0],
-    })
-    grid = terror.expand_to_grid(country_year, ["USA", "DEU"],
-                                 [1992, 1993, 1994])
-    year_1993 = grid[grid["year"] == 1993]
-    check("1993 is NaN, not zero", bool(year_1993["n_attacks"].isna().all()))
-    quiet = grid[(grid["iso3"] == "DEU") & (grid["year"] == 1992)]
-    check("a country with no attacks that year is a real zero",
-          float(quiet["n_attacks"].iloc[0]) == 0.0)
-    check("no MultiIndex comes out of expand_to_grid",
-          isinstance(grid.index, pd.RangeIndex)
-          and {"iso3", "year"} <= set(grid.columns))
+    rate = write(directory, "rate.csv",
+                 "country,year,value\nUSA,1990,100\nUSA,1991,-100\n")
+    rated = io_tabular.apply_transform(io_tabular.load_table(rate, "x"), "x",
+                                       "log_rate")
+    check("log_rate is ln(1 + x/100) and drops -100%",
+          len(rated) == 1 and abs(float(rated["x"].iloc[0])
+                                  - 0.693147) < 1e-5)
 
 
 def main() -> int:
@@ -183,8 +146,6 @@ def main() -> int:
         test_unknown_country_is_reported(directory)
         test_clear_errors(directory)
         test_transforms(directory)
-        test_threshold_filter(directory)
-    test_terror_1993_stays_missing()
 
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
     if FAILED:

@@ -1,100 +1,96 @@
-"""Typed declarations of what the program takes from each data file.
+"""Typed declarations of the data series the analysis reads.
 
-Every data file you add must be declared with one of these specs in config.py.
-Nothing is auto-detected unless you explicitly leave a field as None.
+Outcomes (§6.2) and controls (§6.4) are declared with these in config.py, so
+the variable set of the regressions is visible in one place and checked before
+anything is estimated.
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
-# Transforms that may be applied to a variable before it enters a regression.
-TRANSFORMS = (None, "log", "log1p", "pct_change", "diff", "zscore")
+# Transforms that may be applied to a series before it enters a regression.
+#   log       natural log, for levels such as GDP per capita
+#   log_rate  ln(1 + x/100), for rates in per cent that can be very large,
+#             such as inflation; keeps the sign and tames hyperinflation years
+TRANSFORMS = (None, "log", "log_rate")
+
+FOLDERS = ("worldbank", "undp", "classification", "conflict")
 
 
 @dataclass
-class VariableSpec:
-    """Base declaration shared by metrics (dependent) and controls (independent).
+class SeriesSpec:
+    """One country-year series read from data/<folder>/<file>.
 
-    file:            file name inside its folder, e.g. "trade_openness.csv"
-    column:          name of the column holding the number. None = auto-detect
-                     the single remaining numeric column.
-    country_column:  column holding country name or ISO3 code. None = auto-detect.
-    year_column:     column holding the year. None = auto-detect, and if no year
-                     column exists the file is read as wide (one column per year).
-    transform:       see TRANSFORMS. Applied per country, ordered by year.
-    label:           human readable name used in tables and figures.
-    unit:            unit shown on chart axes, e.g. "% of GDP".
-    scale:           multiply raw values by this before use (e.g. 1e-9).
+    column:        the column holding the number (None = auto-detect).
+    transform:     see TRANSFORMS; applied before the lag.
+    lag:           use the value of year t-lag, per country (0 = same year).
+    fill_missing:  value for country-years absent from the file. None keeps
+                   them missing; 0.0 is right for event indicators such as
+                   armed conflict, where absence from the dataset means none.
+    zero_is_missing: treat a value of exactly 0 as missing. For series that
+                   cannot truly be zero - an investment rate or a trade ratio -
+                   the World Bank download sometimes carries 0 as a placeholder
+                   for "no data" (Venezuela 1998-2011). Off by default.
     """
 
     file: str
-    column: Optional[str] = None
-    country_column: Optional[str] = None
-    year_column: Optional[str] = None
+    folder: str = "worldbank"
+    column: Optional[str] = "value"
     transform: Optional[str] = None
+    lag: int = 0
+    fill_missing: Optional[float] = None
     label: str = ""
     unit: str = ""
-    scale: float = 1.0
+    source: str = ""
+    zero_is_missing: bool = False
 
     def __post_init__(self):
         if self.transform not in TRANSFORMS:
-            raise ValueError(
-                f"{self.file}: transform={self.transform!r} is not one of {TRANSFORMS}"
-            )
+            raise ValueError(f"{self.file}: transform={self.transform!r} is "
+                             f"not one of {TRANSFORMS}")
+        if self.folder not in FOLDERS:
+            raise ValueError(f"{self.file}: folder={self.folder!r} is not one "
+                             f"of {FOLDERS}")
+        if self.lag < 0:
+            raise ValueError(f"{self.file}: lag must be 0 or positive")
 
 
 @dataclass
-class MetricSpec(VariableSpec):
-    """A DEPENDENT variable. Each metric gets its own independent regression.
+class ControlSpec(SeriesSpec):
+    """A control variable (§6.4). `precedent` records why it is in the model -
+    the plan requires every control to be justified by precedent."""
 
-    min_years:     a country needs at least this many usable years to be kept.
-    min_countries: the whole metric is skipped if fewer countries survive.
+    precedent: str = ""
+
+
+@dataclass
+class OutcomeSpec:
+    """An outcome variable (§6.2), one per hypothesis.
+
+    files:  one file, or several whose values are ADDED per country-year - the
+            FDI ratio is inflows plus outflows (File 1 §3.1). A country-year
+            missing any part is missing, never a partial sum.
+    exclude_mean_above:
+            leave a market out of THIS outcome's regressions when its mean
+            value over the window is above this number. The market stays in
+            the sample, the TSI pool and every other regression. Used for the
+            FDI ratio, where financial centres record pass-through capital of
+            several times their GDP (§6.2). None = no rule.
     """
 
-    min_years: int = 10
-    min_countries: int = 15
-
-
-@dataclass
-class ControlSpec(VariableSpec):
-    """An INDEPENDENT control variable, held fixed in every model."""
-
-
-@dataclass
-class FilterSpec(VariableSpec):
-    """Classification data used to split countries (e.g. developed vs developing).
-
-    rule="threshold"    -> value >= threshold gets high_label, otherwise low_label.
-    rule="categorical"  -> the raw text value is mapped through `categories`.
-
-    mode="static"       -> one fixed tag per country, computed from static_stat
-                           over the study period. Recommended: the group never
-                           changes, so the interaction term is interpretable.
-    mode="time_varying" -> a country may change group from year to year.
-
-    static_stat: "median" | "mean" | "first" | "last" - how a country's single
-                 value is derived under mode="static".
-    """
-
-    rule: str = "threshold"
-    threshold: Optional[float] = None
-    high_label: str = "developed"
-    low_label: str = "developing"
-    categories: Dict[str, str] = field(default_factory=dict)
-    mode: str = "static"
-    static_stat: str = "median"
+    files: Tuple[str, ...]
+    hypothesis: str
+    label: str
+    unit: str
+    source: str = ""
+    folder: str = "worldbank"
+    exclude_mean_above: Optional[float] = None
 
     def __post_init__(self):
-        super().__post_init__()
-        if self.rule not in ("threshold", "categorical"):
-            raise ValueError(f"{self.file}: rule must be 'threshold' or 'categorical'")
-        if self.rule == "threshold" and self.threshold is None:
-            raise ValueError(f"{self.file}: rule='threshold' needs a threshold value")
-        if self.rule == "categorical" and not self.categories:
-            raise ValueError(f"{self.file}: rule='categorical' needs a categories map")
-        if self.mode not in ("static", "time_varying"):
-            raise ValueError(f"{self.file}: mode must be 'static' or 'time_varying'")
-        if self.static_stat not in ("median", "mean", "first", "last"):
-            raise ValueError(
-                f"{self.file}: static_stat must be median, mean, first or last"
-            )
+        if isinstance(self.files, str):
+            self.files = (self.files,)
+        if not self.files:
+            raise ValueError("an outcome needs at least one file")
+        if self.hypothesis not in ("H1", "H2"):
+            raise ValueError(f"hypothesis must be 'H1' or 'H2', "
+                             f"got {self.hypothesis!r}")

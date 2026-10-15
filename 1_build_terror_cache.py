@@ -1,25 +1,25 @@
 # -*- coding: utf-8 -*-
 """STEP 1 - convert the Global Terrorism Database into a fast cache.
 
-Run this once (press the green arrow in PyCharm). It reads the 104 MB GTD xlsx,
-keeps the twenty columns this project needs, and writes two parquet files into
-data/cache/. Every later run loads those in under a second.
+Run this once. It reads the 104 MB GTD xlsx, keeps only the fields File 3 and
+plan §5.2-§5.8 name (qualification, severity traits, event flags), and writes
+data/cache/gtd_events.parquet. Every later run loads that in under a second.
 
-Takes a few minutes. You only have to do it again if you get a newer GTD file.
+Takes a few minutes. Run it again only if you get a newer GTD file, or if
+2_build_sample.py says the cache predates the current code.
 """
 
 import sys
 
 import config
-from seminar import paths, terror, viz
+from seminar import countries, paths, terror
 
 
 def main() -> int:
     paths.ensure_dirs()
-
-    print("=" * 70)
-    print("STEP 1  building the terrorism cache")
-    print("=" * 70)
+    print("=" * 72)
+    print("STEP 1  building the GTD cache")
+    print("=" * 72)
 
     try:
         events = terror.convert_to_parquet(config.GTD_XLSX,
@@ -28,43 +28,20 @@ def main() -> int:
         print(f"\nERROR: {error}")
         return 1
 
-    print("\nAggregating to country-year measures")
-    country_year = terror.build_country_year(
-        events,
-        require_all_criteria=config.GTD_REQUIRE_ALL_CRITERIA,
-        drop_doubted=config.GTD_DROP_DOUBTED,
-    )
-    country_year.to_parquet(paths.GTD_COUNTRY_YEAR_PARQUET, index=False)
-    print(f"  cached -> {paths.GTD_COUNTRY_YEAR_PARQUET}")
-
     print("\nSanity checks")
-    print(terror.describe(country_year))
+    print(terror.describe(events, config.WINDOW))
+    funnel = terror.event_funnel(events, config.WINDOW, "all GTD countries")
+    print(f"\nFile 3 qualification funnel, {config.WINDOW[0]}-"
+          f"{config.WINDOW[1]} (all countries)")
+    for _, row in funnel.iterrows():
+        print(f"  {row['label']:<48}{int(row['events']):>9,}  "
+              f"({row['pct_of_window']:.1f}%)")
 
-    first_year, last_year = config.PERIOD
-    in_period = country_year[country_year["year"].between(first_year, last_year)]
-    print(f"\nInside the study period {first_year}-{last_year}")
-    print(terror.describe(in_period))
-
-    worst = (in_period.groupby("iso3")["n_killed"].sum()
-             .sort_values(ascending=False).head(10))
-    print("\nMost affected countries in the period (people killed):")
-    for iso3, killed in worst.items():
-        print(f"  {iso3}  {int(killed):>8,}")
-
-    figure = viz.terror_overview(in_period,
-                                 paths.FIGURES_DIR / "terrorism_over_time.png",
-                                 dpi=config.FIGURE_DPI)
-    if figure:
-        print(f"\nFigure -> {figure}")
-
-    from seminar import countries
     report = countries.write_unmatched_report()
     if report:
-        print(f"Unresolved country names listed in {report}")
-        print("Add any real countries to data/reference/country_aliases.csv")
+        print(f"\nUnresolved country names listed in {report}")
 
-    print("\nDone. Next: put your metric files in data/metrics/, declare them "
-          "in config.py, then run 2_check_data.py")
+    print("\nDone. Next: 2_build_sample.py")
     return 0
 
 

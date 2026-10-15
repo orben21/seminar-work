@@ -39,8 +39,9 @@ AGGREGATE_NAMES = {
 }
 
 # Names the pycountry database does not know, or knows differently. Includes the
-# GTD's historical entities: the panel starts in 1990, which still catches the
-# Soviet Union, Yugoslavia, Czechoslovakia and both Germanys.
+# GTD's historical entities. Mapping Yugoslavia and Serbia-Montenegro to SRB
+# does not smuggle them into the sample: Q1 (seminar/qualification.py) fails any
+# country that the GTD names more than one way inside the window.
 BUILTIN_ALIASES: Dict[str, str] = {
     # --- GTD historical entities -> successor state used for the panel ---
     "soviet union": "RUS",
@@ -102,6 +103,8 @@ BUILTIN_ALIASES: Dict[str, str] = {
     "cote divoire": "CIV",
     "democratic republic of the congo": "COD",
     "congo, dem. rep.": "COD",
+    "dr congo": "COD",                       # UCDP's name
+    "dr congo (zaire)": "COD",
     "people's republic of the congo": "COG",
     "republic of the congo": "COG",
     "congo, rep.": "COG",
@@ -288,8 +291,19 @@ def write_unmatched_report() -> Optional[str]:
     return str(paths.UNMATCHED_COUNTRIES_CSV)
 
 
+# Short names for charts where pycountry's official form is long or missing.
+DISPLAY_NAMES = {
+    "COD": "DR Congo", "COG": "Congo", "RUS": "Russia", "PSE": "Palestine",
+    "XKX": "Kosovo", "SYR": "Syria", "TZA": "Tanzania", "LAO": "Laos",
+    "BOL": "Bolivia", "VEN": "Venezuela", "IRN": "Iran", "MDA": "Moldova",
+    "KOR": "South Korea", "PRK": "North Korea",
+}
+
+
 def name_of(iso3: str) -> str:
     """ISO3 back to a readable country name, for charts and tables."""
+    if iso3 in DISPLAY_NAMES:
+        return DISPLAY_NAMES[iso3]
     try:
         country = pycountry.countries.get(alpha_3=iso3)
         if country is not None:

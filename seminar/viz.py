@@ -1,458 +1,759 @@
-"""Figures. Everything is saved as a 300 dpi PNG, ready to drop into the paper.
+"""The data figures of the plan's master list (Part 3), numbered as there.
 
-Seven kinds of figure:
+    1   qualifying attacks by group, 1998-2020          §1.1
+    5   sectoral composition of the sample              §3.3.2
+    6   sample selection funnel Q1-Q6                   §3.5
+    8   HDI distribution with the 0.800 cut-off         §4.2
+    9   HDI against GNI per capita                      §4.3
+    10  cross-institutional agreement matrix            §4.4
+    11  event qualification funnel K1-K6 + floor        §5.2
+    12  composition of qualifying events                §5.4
+    13A skewness of annual fatality counts, by market   §5.6
+    14  raw vs log vs z-score                           §5.6
+    15  TSI heatmap, market x year                      §6.6
+    16  correlation matrix                              §6.6
+    17  TSI components over time by group               §8.1
+    18  TSI distribution by group                       §8.1
+    19  GDP growth and FDI ratio over time              §8.2
+    20  coefficient plot, GDP growth                    §8.4
+    21  coefficient plot, FDI ratio                     §8.5
+    22  marginal effect of TSI by group (headline)      §8.6
+    23  binned scatter, TSI vs outcome                  §8.6
+    24  component coefficients                          §8.7
 
-  1 coverage heatmap        what data you actually have, per metric
-  2 before/after chart      Model A next to Model B - what terrorism changed
-  3 effect forest plot      the terror effect, developed vs developing
-  4 lag profile             the cumulative long-run effect year by year
-  5 partial regression      the isolated terror effect as a scatter
-  6 group trends            metric over time by group, terrorism overlaid
-  7 cross-metric summary    every metric's terror effect on one comparable axis
+Figures 2, 3, 4, 7 and 13 are conceptual diagrams and are not drawn from data
+(Figure 13's worked example is written as t5_6_worked_example.csv).
+
+Consistency rules (Part 3): one colour per group in every figure, every axis
+labelled with units, every figure captioned with its data source.
 """
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Sequence
 
 import matplotlib
 matplotlib.use("Agg")                      # no display needed; write files
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import statsmodels.formula.api as smf
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
 
-from .panel import Panel
-from .regression import MetricResult, _stars
+from .tsi import COMPONENT_LABELS, COMPONENTS
 
-# One consistent look for every figure.
-COLOR_BEFORE = "#8895a7"
-COLOR_AFTER = "#1f4e79"
-COLOR_TERROR = "#b23a48"
 COLOR_DEVELOPED = "#1f4e79"
 COLOR_DEVELOPING = "#d98032"
+COLOR_NEUTRAL = "#8895a7"
+COLOR_ACCENT = "#b23a48"
 COLOR_GRID = "#dfe3e8"
+COLOR_TEXT = "#22282e"
 GROUP_COLORS = {"developed": COLOR_DEVELOPED, "developing": COLOR_DEVELOPING}
+GROUPS = ("developed", "developing")
+
+GTD_SOURCE = "GTD 0522 (START); qualifying events, File 3 K1-K6 + floor"
+WDI_SOURCE = "World Bank WDI"
 
 plt.rcParams.update({
-    "figure.facecolor": "white",
-    "axes.facecolor": "white",
-    "axes.edgecolor": "#5b6672",
-    "axes.labelcolor": "#22282e",
-    "axes.titlesize": 12,
-    "axes.titleweight": "bold",
-    "axes.labelsize": 10,
-    "xtick.labelsize": 9,
-    "ytick.labelsize": 9,
-    "legend.frameon": False,
+    "figure.facecolor": "white", "axes.facecolor": "white",
+    "axes.edgecolor": "#5b6672", "axes.labelcolor": COLOR_TEXT,
+    "axes.titlesize": 12, "axes.titleweight": "bold", "axes.labelsize": 10,
+    "xtick.labelsize": 9, "ytick.labelsize": 9, "legend.frameon": False,
     "font.size": 10,
 })
 
 
-def _style(axis, title="", xlabel="", ylabel=""):
+def _style(axis, title="", xlabel="", ylabel="", grid_axis="both"):
     axis.set_title(title, loc="left", pad=10)
     axis.set_xlabel(xlabel)
     axis.set_ylabel(ylabel)
-    axis.grid(True, color=COLOR_GRID, linewidth=0.7, zorder=0)
+    axis.grid(True, axis=grid_axis, color=COLOR_GRID, linewidth=0.7, zorder=0)
     axis.set_axisbelow(True)
     for side in ("top", "right"):
         axis.spines[side].set_visible(False)
     return axis
 
 
-def _save(figure, path: Path, dpi: int = 300) -> Path:
+def _save(figure, path: Path, source: str, dpi: int = 300) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    figure.tight_layout()
+    figure.tight_layout(rect=(0, 0.035, 1, 1))
+    figure.text(0.01, 0.008, f"Source: {source}", fontsize=7.5,
+                color="#667180", ha="left", va="bottom")
     figure.savefig(path, dpi=dpi, bbox_inches="tight")
     plt.close(figure)
     return path
 
 
-# --------------------------------------------------------------------------
-# 1. data coverage
-# --------------------------------------------------------------------------
+def _group_of(sample: pd.DataFrame) -> Dict[str, str]:
+    return dict(zip(sample["iso3"], sample["group"]))
 
-def coverage_heatmap(matrix: pd.DataFrame, name: str, path: Path,
-                     max_countries: int = 60, dpi: int = 300) -> Optional[Path]:
-    """Which country-years actually have data. Look at this first."""
-    if matrix.empty:
-        return None
-    ordered = matrix.loc[matrix.sum(axis=1).sort_values(ascending=False).index]
-    truncated = len(ordered) > max_countries
-    shown = ordered.head(max_countries)
 
-    height = max(3.0, 0.16 * len(shown) + 1.6)
-    figure, axis = plt.subplots(figsize=(11, height))
-    axis.imshow(shown.values, aspect="auto", cmap="Blues", vmin=0, vmax=1,
-                interpolation="nearest")
+def _labelled(table: pd.DataFrame, sample: pd.DataFrame) -> pd.DataFrame:
+    """Attach country name and group from the classified sample, replacing
+    any copies the table already carries."""
+    table = table.drop(columns=[c for c in ("country", "group")
+                                if c in table.columns])
+    return table.merge(sample[["iso3", "country", "group"]], on="iso3")
 
-    axis.set_yticks(range(len(shown)))
-    axis.set_yticklabels(shown.index, fontsize=6)
-    years = list(shown.columns)
-    step = max(1, len(years) // 16)
-    axis.set_xticks(range(0, len(years), step))
-    axis.set_xticklabels(years[::step], rotation=45, ha="right")
 
-    filled = float(shown.values.mean()) * 100
-    title = f"Data coverage: {name}  ({filled:.0f}% of country-years present)"
-    if truncated:
-        title += f"  [top {max_countries} of {len(ordered)} countries]"
-    axis.set_title(title, loc="left", pad=10)
-    axis.grid(False)
-    return _save(figure, path, dpi)
+def _colour_ticklabels(axis, labels: Sequence[str], groups: Sequence[str]):
+    for tick, group in zip(axis.get_yticklabels(), groups):
+        tick.set_color(GROUP_COLORS.get(group, COLOR_TEXT))
+
+
+def _group_legend(axis, loc="best", extra: Optional[List] = None):
+    handles = [Patch(color=GROUP_COLORS[g], label=g) for g in GROUPS]
+    axis.legend(handles=handles + (extra or []), loc=loc)
 
 
 # --------------------------------------------------------------------------
-# 2. before / after terrorism
+# 1  qualifying attacks by group
 # --------------------------------------------------------------------------
 
-def before_after_chart(result: MetricResult, path: Path,
-                       dpi: int = 300) -> Optional[Path]:
-    """Every coefficient in Model A next to Model B, plus the R2 gain."""
-    if "A" not in result.models or "B" not in result.models:
-        return None
-    model_a, model_b = result.models["A"], result.models["B"]
-
-    def rows(model):
-        table = model.coefficients
-        return table[table["term"] != "Intercept"].set_index("term")
-
-    before, after = rows(model_a), rows(model_b)
-    controls = [t for t in after.index if t in before.index]
-    added = [t for t in after.index if t not in before.index]
-    if not controls and not added:
-        return None
-
-    # The terrorism term gets its own x-axis. Its confidence interval is usually
-    # far narrower than the controls', and on a shared scale it collapses into
-    # a dot right when it is the thing you came to look at.
-    height = 1.4 + 0.62 * (len(controls) + len(added))
-    figure = plt.figure(figsize=(11, height))
-    grid = figure.add_gridspec(
-        2, 2, width_ratios=[3, 1],
-        height_ratios=[max(len(controls), 1), max(len(added), 1)],
-        hspace=0.55, wspace=0.08)
-    axis = figure.add_subplot(grid[0, 0])
-    lower = figure.add_subplot(grid[1, 0])
-    panel = figure.add_subplot(grid[:, 1])
-
-    def draw(target, terms, show_before):
-        positions = np.arange(len(terms))
-        offset = 0.18 if show_before else 0.0
-        for index, term in enumerate(terms):
-            if show_before and term in before.index:
-                row = before.loc[term]
-                target.errorbar(row["coef"], positions[index] + offset,
-                                xerr=[[row["coef"] - row["ci_low"]],
-                                      [row["ci_high"] - row["coef"]]],
-                                fmt="o", color=COLOR_BEFORE, capsize=3,
-                                markersize=6,
-                                label="before terrorism" if index == 0 else None)
-            row = after.loc[term]
-            color = COLOR_TERROR if term == "terror" else COLOR_AFTER
-            target.errorbar(row["coef"], positions[index] - offset,
-                            xerr=[[row["coef"] - row["ci_low"]],
-                                  [row["ci_high"] - row["coef"]]],
-                            fmt="o", color=color, capsize=3, markersize=6,
-                            label="after terrorism" if index == 0 else None)
-        target.axvline(0, color="#22282e", linewidth=1.0, linestyle="--",
-                       zorder=1)
-        target.set_yticks(positions)
-        target.set_yticklabels(terms)
-        target.invert_yaxis()
-        target.margins(y=0.35)
-
-    draw(axis, controls, show_before=True)
-    _style(axis, f"{result.label}: coefficients before and after adding terrorism",
-           f"controls - coefficient (95% CI), {result.unit or 'metric units'}")
-
-    draw(lower, added, show_before=False)
-    _style(lower, "", f"terrorism - coefficient (95% CI), own scale, "
-                      f"{result.unit or 'metric units'}")
-
-    comparison = result.comparison
-    panel.axis("off")
-    lines = [
-        "within-country R2",
-        f"  before   {comparison['r2_within_before']:.4f}",
-        f"  after    {comparison['r2_within_after']:.4f}",
-        f"  gain    {comparison['r2_within_gain']:+.4f}",
-        "",
-        "terrorism term",
-        f"  coef  {comparison['terror_coef']:+.4g}",
-        f"  p     {comparison['terror_p']:.4f}",
-        "",
-        f"{result.n_obs:,} country-years",
-        f"{result.n_countries} countries",
-        f"{result.year_min}-{result.year_max}",
-    ]
-    panel.text(0.0, 0.98, "\n".join(lines), va="top", ha="left",
-               family="monospace", fontsize=9)
-    # The legend lives here, where there is room: on the plot itself it sits on
-    # top of the error bars.
-    handles = [plt.Line2D([], [], color=COLOR_BEFORE, marker="o", linestyle="none"),
-               plt.Line2D([], [], color=COLOR_AFTER, marker="o", linestyle="none"),
-               plt.Line2D([], [], color=COLOR_TERROR, marker="o", linestyle="none")]
-    panel.legend(handles, ["before terrorism", "after terrorism", "terrorism term"],
-                 loc="lower left", fontsize=9, handletextpad=0.4)
-    return _save(figure, path, dpi)
+def fig01_qualifying_attacks(country_year: pd.DataFrame, sample: pd.DataFrame,
+                             path: Path, dpi: int = 300) -> Path:
+    data = country_year.assign(group=country_year["iso3"].map(
+        _group_of(sample)))
+    yearly = data.pivot_table(index="year", columns="group", values="NA",
+                              aggfunc="sum")
+    figure, axis = plt.subplots(figsize=(10, 5))
+    for year, label in ((2008, "Apr 2008"), (2012, "Jan 2012")):
+        axis.axvspan(year - 0.5, year + 0.5, color="#eceff3", zorder=0)
+        axis.text(year, 1.0, f"GTD collection\nbreak, {label}",
+                  transform=axis.get_xaxis_transform(), ha="center",
+                  va="top", fontsize=8, color="#667180")
+    for group in GROUPS:
+        if group in yearly.columns:
+            axis.plot(yearly.index, yearly[group], "-o", markersize=4,
+                      linewidth=2, color=GROUP_COLORS[group],
+                      label=f"{group} markets")
+    axis.legend(loc="upper left")
+    _style(axis, "Figure 1 - Qualifying terrorist attacks, 1998-2020",
+           "year", "qualifying attacks per year (count)")
+    return _save(figure, path, GTD_SOURCE + "; sample markets of File 1", dpi)
 
 
 # --------------------------------------------------------------------------
-# 3. the effect, developed vs developing
+# 5  sectoral composition
 # --------------------------------------------------------------------------
 
-def effect_forest(result: MetricResult, path: Path,
-                  dpi: int = 300) -> Optional[Path]:
-    """Terrorism's estimated effect overall and by group."""
-    rows = []
-    comparison = result.comparison
-    if np.isfinite(comparison.get("terror_coef", np.nan)):
-        rows.append({"group": "all countries",
-                     "coef": comparison["terror_coef"],
-                     "ci_low": comparison["terror_ci_low"],
-                     "ci_high": comparison["terror_ci_high"],
-                     "p": comparison["terror_p"]})
-    if not result.group_effects.empty:
-        rows.extend(result.group_effects.to_dict("records"))
-    if not rows:
-        return None
-
-    table = pd.DataFrame(rows)
-    figure, axis = plt.subplots(figsize=(8.5, 1.2 + 0.7 * len(table)))
-    positions = np.arange(len(table))
-
-    for index, row in table.iterrows():
-        color = GROUP_COLORS.get(str(row["group"]), COLOR_AFTER)
-        if str(row["group"]).startswith("difference"):
-            color = COLOR_TERROR
-        axis.errorbar(row["coef"], positions[index],
-                      xerr=[[row["coef"] - row["ci_low"]],
-                            [row["ci_high"] - row["coef"]]],
-                      fmt="o", color=color, capsize=4, markersize=8)
-        stars = _stars(row["p"])          # never trust a missing 'stars' cell
-        axis.annotate(f"{row['coef']:+.3g}{stars}",
-                      (row["coef"], positions[index]),
-                      textcoords="offset points", xytext=(0, 11),
-                      ha="center", fontsize=9, color=color)
-
-    axis.axvline(0, color="#22282e", linewidth=1.0, linestyle="--")
-    axis.set_yticks(positions)
-    axis.set_yticklabels(table["group"])
-    axis.invert_yaxis()
-    axis.margins(y=0.25)
-    _style(axis,
-           f"{result.label}: effect of {result.terror_measure}",
-           f"change in {result.label} ({result.unit or 'units'}) per unit of "
-           f"{result.terror_measure}")
-    return _save(figure, path, dpi)
-
-
-# --------------------------------------------------------------------------
-# 4. the long run
-# --------------------------------------------------------------------------
-
-def lag_profile_chart(result: MetricResult, path: Path,
-                      dpi: int = 300) -> Optional[Path]:
-    """Effect at each lag, and the cumulative effect with its confidence band."""
-    profile = result.lag_profile
-    if profile.empty:
-        return None
-
-    figure, axis = plt.subplots(figsize=(9, 5))
-    axis.bar(profile["lag"], profile["coef"], width=0.45,
-             color=COLOR_BEFORE, label="effect in that year alone", zorder=2)
-    axis.errorbar(profile["lag"], profile["coef"],
-                  yerr=[profile["coef"] - profile["ci_low"],
-                        profile["ci_high"] - profile["coef"]],
-                  fmt="none", ecolor="#5b6672", capsize=3, zorder=3)
-
-    if profile["cumulative"].notna().any():
-        axis.plot(profile["lag"], profile["cumulative"], "-o",
-                  color=COLOR_TERROR, linewidth=2, markersize=6,
-                  label="cumulative effect", zorder=4)
-        axis.fill_between(profile["lag"], profile["cumulative_ci_low"],
-                          profile["cumulative_ci_high"],
-                          color=COLOR_TERROR, alpha=0.15, zorder=1)
-
-    axis.axhline(0, color="#22282e", linewidth=1.0, linestyle="--")
-    axis.set_xticks(profile["lag"])
-    axis.legend(loc="best")
-    _style(axis,
-           f"{result.label}: how long the effect of terrorism lasts",
-           "years since the terrorism happened",
-           f"change in {result.label} ({result.unit or 'units'})")
-    return _save(figure, path, dpi)
-
-
-# --------------------------------------------------------------------------
-# 5. the isolated effect
-# --------------------------------------------------------------------------
-
-def partial_regression_plot(frame: pd.DataFrame, result: MetricResult,
-                            path: Path, dpi: int = 300) -> Optional[Path]:
-    """Terrorism vs the metric once everything else has been partialled out."""
-    if frame.empty:
-        return None
-
-    figure, axis = plt.subplots(figsize=(8.5, 6))
-    for group, chunk in frame.groupby("group", dropna=True):
-        axis.scatter(chunk["terror_resid"], chunk["metric_resid"], s=12,
-                     alpha=0.45, label=str(group), zorder=2,
-                     color=GROUP_COLORS.get(str(group), COLOR_AFTER))
-
-    x = frame["terror_resid"].to_numpy(dtype=float)
-    y = frame["metric_resid"].to_numpy(dtype=float)
-    if len(x) > 2 and np.std(x) > 0:
-        slope, intercept = np.polyfit(x, y, 1)
-        line = np.linspace(x.min(), x.max(), 100)
-        axis.plot(line, slope * line + intercept, color=COLOR_TERROR,
-                  linewidth=2, zorder=3,
-                  label=f"slope = {slope:+.3g} (the coefficient)")
-
-    axis.axhline(0, color="#9aa4ae", linewidth=0.8)
-    axis.axvline(0, color="#9aa4ae", linewidth=0.8)
-
-    # A handful of extreme country-years can squash the whole cloud into a line.
-    # The view is clipped to the central 99%, and says how many points that hides
-    # - the fitted line still uses every observation.
-    low, high = np.nanpercentile(y, [0.5, 99.5])
-    padding = 0.08 * (high - low) if high > low else 1.0
-    hidden = int(((y < low - padding) | (y > high + padding)).sum())
-    if hidden:
-        axis.set_ylim(low - padding, high + padding)
-        axis.annotate(f"{hidden} extreme point(s) outside this view;\n"
-                      f"the fitted line uses all {len(y):,} observations",
-                      xy=(0.02, 0.02), xycoords="axes fraction", fontsize=8,
-                      color="#667180", va="bottom")
-
-    axis.legend(loc="best")
-    _style(axis,
-           f"{result.label}: the isolated effect of terrorism",
-           f"{result.terror_measure}, with controls and fixed effects removed",
-           f"{result.label}, with controls and fixed effects removed")
-    return _save(figure, path, dpi)
-
-
-# --------------------------------------------------------------------------
-# 6. group trends over time
-# --------------------------------------------------------------------------
-
-def group_trend_chart(panel: Panel, result: MetricResult, path: Path,
-                      dpi: int = 300) -> Optional[Path]:
-    """The metric over time for each group, with terrorism intensity behind it."""
-    data = panel.data
+def fig05_sectoral_composition(shares: pd.DataFrame, sample: pd.DataFrame,
+                               base_year: int, path: Path,
+                               dpi: int = 300) -> Optional[Path]:
+    data = sample[["iso3", "country", "group", "hdi"]].merge(
+        shares, on="iso3", how="inner").dropna(
+        subset=["agriculture", "industry", "services"])
     if data.empty:
         return None
-
-    figure, axis = plt.subplots(figsize=(10, 5.5))
-    for group, chunk in data.groupby("group", dropna=True):
-        yearly = chunk.groupby("year")[panel.metric].mean()
-        axis.plot(yearly.index, yearly.values, "-o", markersize=4, linewidth=2,
-                  color=GROUP_COLORS.get(str(group), COLOR_AFTER),
-                  label=f"{group} (mean {panel.metric})", zorder=3)
-
-    _style(axis, f"{result.label} and terrorism over time", "year",
-           f"{result.label} ({result.unit or 'units'})")
-
-    twin = axis.twinx()
-    terror_by_year = data.groupby("year")["terror"].mean()
-    twin.fill_between(terror_by_year.index, terror_by_year.values, 0,
-                      color=COLOR_TERROR, alpha=0.12, zorder=1)
-    twin.set_ylabel(f"mean {result.terror_measure}", color=COLOR_TERROR)
-    twin.tick_params(axis="y", colors=COLOR_TERROR)
-    twin.spines["top"].set_visible(False)
-    twin.grid(False)
-
-    handles, labels = axis.get_legend_handles_labels()
-    handles.append(plt.Rectangle((0, 0), 1, 1, color=COLOR_TERROR, alpha=0.12))
-    labels.append(f"mean {result.terror_measure} (right axis)")
-    axis.legend(handles, labels, loc="best")
-    return _save(figure, path, dpi)
+    parts = data[["agriculture", "industry", "services"]]
+    data[["agriculture", "industry", "services"]] = parts.div(
+        parts.sum(axis=1), axis=0) * 100
+    data = data.sort_values("hdi", ascending=True)
+    figure, axis = plt.subplots(figsize=(9.5, max(4, 0.19 * len(data) + 1.5)))
+    left = np.zeros(len(data))
+    colors = {"agriculture": "#9bbf85", "industry": "#8895a7",
+              "services": "#c9d4e0"}
+    for sector in ("agriculture", "industry", "services"):
+        axis.barh(data["country"], data[sector], left=left,
+                  color=colors[sector], label=sector, height=0.8)
+        left += data[sector].to_numpy()
+    axis.set_xlim(0, 100)
+    axis.tick_params(axis="y", labelsize=7)
+    _colour_ticklabels(axis, data["country"], data["group"])
+    axis.legend(loc="lower right", ncol=3, fontsize=8)
+    _style(axis, f"Figure 5 - Sectoral composition at the base year "
+                 f"({base_year}), sorted by HDI",
+           "share of value added (%, rescaled to sum to 100)", "",
+           grid_axis="x")
+    return _save(figure, path, f"{WDI_SOURCE} NV.AGR/NV.IND/NV.SRV.TOTL.ZS; "
+                 f"labels coloured by group (blue developed, orange "
+                 f"developing)", dpi)
 
 
 # --------------------------------------------------------------------------
-# 7. every metric on one axis
+# 6  sample selection funnel
 # --------------------------------------------------------------------------
 
-def cross_metric_summary(results: Dict[str, MetricResult], path: Path,
-                         dpi: int = 300) -> Optional[Path]:
-    """Standardised terror effect per metric: comparable across every metric.
+def fig06_sample_funnel(funnel: pd.DataFrame, path: Path,
+                        dpi: int = 300) -> Path:
+    import textwrap
+    figure, axis = plt.subplots(figsize=(11, 5.6))
+    positions = np.arange(len(funnel))
+    axis.bar(positions, funnel["remaining"], color=COLOR_DEVELOPED,
+             width=0.62, zorder=2)
+    axis.bar(positions, funnel["dropped"], bottom=funnel["remaining"],
+             color="#e4c1c6", hatch="//", edgecolor="white", width=0.62,
+             zorder=2, label="dropped at this rule")
+    for x, (_, row) in zip(positions, funnel.iterrows()):
+        axis.text(x, row["remaining"] / 2, f"{int(row['remaining'])}",
+                  ha="center", va="center", color="white", fontweight="bold")
+        if row["dropped"]:
+            axis.text(x, row["remaining"] + row["dropped"] + 1,
+                      f"-{int(row['dropped'])}", ha="center", va="bottom",
+                      color=COLOR_ACCENT, fontsize=9)
+    labels = [textwrap.fill(str(label), 16) for label in funnel["label"]]
+    axis.set_xticks(positions)
+    axis.set_xticklabels(labels, fontsize=8)
+    axis.set_ylim(0, (funnel["remaining"] + funnel["dropped"]).max() * 1.12)
+    axis.legend(loc="upper right")
+    _style(axis, "Figure 6 - Sample selection funnel (File 1, Q1-Q6)", "",
+           "markets (count)", grid_axis="y")
+    return _save(figure, path, "GTD 0522; World Bank WDI; File 1 rules - "
+                 "exclusion log in t3_5_exclusion_log.csv", dpi)
 
-    Each coefficient is rescaled to "standard deviations of the metric per one
-    standard deviation of terrorism", so metrics measured in different units sit
-    on the same axis.
-    """
+
+# --------------------------------------------------------------------------
+# 8  HDI distribution
+# --------------------------------------------------------------------------
+
+def fig08_hdi_distribution(sample: pd.DataFrame, base_year: int, path: Path,
+                           dpi: int = 300) -> Path:
+    data = sample.dropna(subset=["hdi"]).sort_values("hdi", ascending=True)
+    figure, axis = plt.subplots(figsize=(8.5, max(4, 0.19 * len(data) + 1.5)))
+    axis.axvspan(0.78, 0.82, color="#f3e7c9", zorder=0,
+                 label="borderline band 0.780-0.820")
+    colors = data["group"].map(GROUP_COLORS).fillna(COLOR_NEUTRAL)
+    labels = [f"{c} *" if b else c for c, b in zip(data["country"],
+                                                   data["borderline"])]
+    axis.barh(labels, data["hdi"], color=colors, height=0.75, zorder=2)
+    axis.axvline(0.8, color=COLOR_TEXT, linestyle="--", linewidth=1.2,
+                 zorder=3)
+    axis.set_xlim(max(0.0, data["hdi"].min() - 0.05), 1.0)
+    axis.tick_params(axis="y", labelsize=7)
+    _group_legend(axis, "lower right",
+                  [Patch(color="#f3e7c9", label="borderline band")])
+    _style(axis, f"Figure 8 - HDI of the sample at the base year ({base_year})",
+           "Human Development Index (0-1); dashed line = 0.800 (C1)", "",
+           grid_axis="x")
+    return _save(figure, path, "UNDP HDR composite time series; * = flagged "
+                 "borderline under File 2 §6.2 (any trigger)", dpi)
+
+
+# --------------------------------------------------------------------------
+# 9  HDI vs GNI per capita
+# --------------------------------------------------------------------------
+
+def fig09_hdi_vs_gni(sample: pd.DataFrame, threshold: float, base_year: int,
+                     path: Path, dpi: int = 300) -> Path:
+    data = sample.dropna(subset=["hdi", "gni_atlas"])
+    figure, axis = plt.subplots(figsize=(9, 6.5))
+    for group in GROUPS:
+        chunk = data[data["group"] == group]
+        axis.scatter(chunk["gni_atlas"], chunk["hdi"], s=36,
+                     color=GROUP_COLORS[group], label=f"{group} (C1)",
+                     zorder=3, edgecolor="white", linewidth=0.5)
+    axis.set_xscale("log")
+    axis.axhline(0.8, color=COLOR_TEXT, linestyle="--", linewidth=1)
+    axis.axvline(threshold, color=COLOR_TEXT, linestyle=":", linewidth=1)
+    axis.text(threshold, 0.98, f" high-income line\n US$ {threshold:,.0f}",
+              transform=axis.get_xaxis_transform(), fontsize=8, va="top",
+              color="#46505a")
+    contradictions = data[data["c2_group"].isin(GROUPS)
+                          & (data["c2_group"] != data["group"])]
+    for _, row in contradictions.iterrows():
+        axis.annotate(row["country"], (row["gni_atlas"], row["hdi"]),
+                      textcoords="offset points", xytext=(5, -10), fontsize=8,
+                      color=COLOR_ACCENT)
+    axis.legend(loc="upper left")
+    _style(axis, f"Figure 9 - HDI against GNI per capita, {base_year}",
+           "GNI per capita, Atlas method (current US$, log scale)",
+           "Human Development Index (0-1)")
+    return _save(figure, path, "UNDP HDR; World Bank WDI NY.GNP.PCAP.CD and "
+                 "income classification; labelled = C2 contradicts C1", dpi)
+
+
+# --------------------------------------------------------------------------
+# 10 cross-institutional agreement
+# --------------------------------------------------------------------------
+
+def fig10_agreement_matrix(sample: pd.DataFrame, base_year: int, path: Path,
+                           dpi: int = 300) -> Path:
+    data = sample.dropna(subset=["group"]).copy()
+    data = data.sort_values(["c3_agreements", "group", "hdi"],
+                            ascending=[False, True, False])
+    columns = [("group", "C1 (HDI)"), ("imf_group", "IMF"),
+               ("undp_group", "UNDP"), ("wb_group", "World Bank")]
+    code = {"developed": 0, "developing": 1, "not classified": 2}
+    matrix = np.array([[code.get(str(v), 2) for v in data[c]]
+                       for c, _ in columns]).T
+    cmap = ListedColormap([COLOR_DEVELOPED, COLOR_DEVELOPING, "#e3e7ec"])
+    figure, axis = plt.subplots(figsize=(6.5, max(4, 0.19 * len(data) + 1.5)))
+    axis.imshow(matrix, aspect="auto", cmap=cmap, vmin=0, vmax=2,
+                interpolation="nearest")
+    axis.set_xticks(range(len(columns)))
+    axis.set_xticklabels([label for _, label in columns])
+    axis.xaxis.tick_top()
+    axis.set_yticks(range(len(data)))
+    axis.set_yticklabels([f"{c}  ({int(a)}/3)" for c, a in
+                          zip(data["country"], data["c3_agreements"])],
+                         fontsize=7)
+    axis.legend(handles=[Patch(color=COLOR_DEVELOPED, label="developed"),
+                         Patch(color=COLOR_DEVELOPING, label="developing"),
+                         Patch(color="#e3e7ec", label="not classified")],
+                loc="upper center", bbox_to_anchor=(0.5, -0.01), ncol=3,
+                fontsize=8)
+    axis.set_title(f"Figure 10 - Agreement with C1 at {base_year}",
+                   loc="left", pad=28)
+    for side in ("top", "right", "bottom", "left"):
+        axis.spines[side].set_visible(False)
+    return _save(figure, path, "UNDP HDR (top-quartile rule), IMF WEO, World "
+                 "Bank; (k/3) = institutions agreeing with C1", dpi)
+
+
+# --------------------------------------------------------------------------
+# 11 event qualification funnel
+# --------------------------------------------------------------------------
+
+def fig11_event_funnel(funnel: pd.DataFrame, path: Path,
+                       dpi: int = 300) -> Path:
+    world = funnel[funnel["population"] == "all GTD countries"]
+    figure, (left, right) = plt.subplots(1, 2, figsize=(13, 5.2),
+                                         gridspec_kw={"width_ratios": [1.3,
+                                                                       1]})
+    positions = np.arange(len(world))
+    left.bar(positions, world["events"], color=COLOR_NEUTRAL, width=0.62,
+             zorder=2)
+    for x, (_, row) in zip(positions, world.iterrows()):
+        left.text(x, row["events"], f"{int(row['events']):,}\n"
+                  f"{row['pct_of_window']:.0f}%", ha="center", va="bottom",
+                  fontsize=8)
+    left.set_xticks(positions)
+    left.set_xticklabels([s for s in world["stage"]], fontsize=8)
+    left.set_ylim(0, world["events"].max() * 1.18)
+    _style(left, "Figure 11 - Event qualification funnel", "stage",
+           "events (count), all GTD countries", grid_axis="y")
+
+    styles = {"all GTD countries": (COLOR_NEUTRAL, "-", 2.2),
+              "developed markets": (COLOR_DEVELOPED, "-", 1.8),
+              "developing markets": (COLOR_DEVELOPING, "--", 1.8)}
+    for population, (color, line, width) in styles.items():
+        chunk = funnel[funnel["population"] == population]
+        if chunk.empty:
+            continue
+        right.plot(np.arange(len(chunk)), chunk["pct_of_window"], line,
+                   marker="o", color=color, linewidth=width, label=population)
+    right.set_xticks(positions)
+    right.set_xticklabels(list(world["stage"]), fontsize=8)
+    right.set_ylim(0, 105)
+    right.legend(loc="lower left")
+    _style(right, "Share retained, by group", "stage",
+           "% of events in window still qualifying", grid_axis="y")
+    return _save(figure, path, GTD_SOURCE + "; counts in t5_2_event_funnel.csv",
+                 dpi)
+
+
+# --------------------------------------------------------------------------
+# 12 composition of qualifying events
+# --------------------------------------------------------------------------
+
+def fig12_event_composition(events: pd.DataFrame, sample: pd.DataFrame,
+                            path: Path, dpi: int = 300) -> Path:
+    data = events.assign(group=events["iso3"].map(_group_of(sample)))
+    data = data[data["group"].isin(GROUPS)]
+    figure, (left, right) = plt.subplots(1, 2, figsize=(12, 5))
+
+    damaged = data[data["property"] == 1].copy()
+    damaged["band"] = damaged["propextent"].fillna(4).astype(int)
+    band_order = [(1, "catastrophic", "#5b1a26"), (2, "major", COLOR_ACCENT),
+                  (3, "minor", "#e3a3ab"), (4, "unknown -> minor", "#f1d9dc")]
+    for index, group in enumerate(GROUPS):
+        chunk = damaged[damaged["group"] == group]
+        total = max(len(chunk), 1)
+        bottom = 0.0
+        for band, label, color in band_order:
+            share = (chunk["band"] == band).sum() / total * 100
+            left.bar(index, share, bottom=bottom, color=color, width=0.55,
+                     hatch="//" if band == 4 else None, edgecolor="white",
+                     label=label if index == 0 else None, zorder=2)
+            bottom += share
+        left.text(index, 101, f"n = {len(chunk):,}", ha="center", fontsize=8)
+    left.set_xticks(range(len(GROUPS)))
+    left.set_xticklabels(GROUPS)
+    left.set_ylim(0, 108)
+    left.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=2,
+                fontsize=8)
+    _style(left, "Figure 12a - Extent of property damage", "",
+           "% of qualifying events with property damage", grid_axis="y")
+
+    casualty = (data["nkill"] >= 1) | (data["nwound"] >= 1)
+    prop = data["property"] == 1
+    kinds = pd.Series(np.select([prop & ~casualty, casualty & ~prop,
+                                 casualty & prop],
+                                ["property only", "casualties only", "both"],
+                                default="other"), index=data.index)
+    colors = {"property only": "#c9d4e0", "casualties only": COLOR_NEUTRAL,
+              "both": COLOR_TEXT}
+    for index, group in enumerate(GROUPS):
+        chunk = kinds[data["group"] == group]
+        total = max(len(chunk), 1)
+        bottom = 0.0
+        for kind, color in colors.items():
+            share = (chunk == kind).sum() / total * 100
+            right.bar(index, share, bottom=bottom, color=color, width=0.55,
+                      label=kind if index == 0 else None, zorder=2)
+            if share >= 6:
+                right.text(index, bottom + share / 2, f"{share:.0f}%",
+                           ha="center", va="center", fontsize=8,
+                           color="white" if kind != "property only"
+                           else COLOR_TEXT)
+            bottom += share
+        right.text(index, 101, f"n = {len(chunk):,}", ha="center", fontsize=8)
+    right.set_xticks(range(len(GROUPS)))
+    right.set_xticklabels(GROUPS)
+    right.set_ylim(0, 108)
+    right.legend(loc="upper center", bbox_to_anchor=(0.5, -0.08), ncol=3,
+                 fontsize=8)
+    _style(right, "Figure 12b - What qualified the event", "",
+           "% of qualifying events", grid_axis="y")
+    return _save(figure, path, GTD_SOURCE + "; hatched = propextent 4 recoded "
+                 "to minor (File 3 §5.1)", dpi)
+
+
+# --------------------------------------------------------------------------
+# 13A and 14: why the log transform
+# --------------------------------------------------------------------------
+
+def fig13a_skewness_by_market(skew: pd.DataFrame, sample: pd.DataFrame,
+                              path: Path, dpi: int = 300) -> Path:
+    data = _labelled(skew, sample)
+    undefined = int(data["skewness"].isna().sum())
+    data = data.dropna(subset=["skewness"]).sort_values("skewness")
+    figure, axis = plt.subplots(figsize=(8.5, max(4, 0.19 * len(data) + 1.5)))
+    axis.barh(data["country"], data["skewness"],
+              color=data["group"].map(GROUP_COLORS), height=0.75, zorder=2)
+    axis.axvline(0, color=COLOR_TEXT, linewidth=0.8)
+    axis.tick_params(axis="y", labelsize=7)
+    _group_legend(axis, "lower right")
+    _style(axis, "Figure 13A - Skewness of annual fatality counts (raw NK), "
+                 "by market", "skewness of the market's own annual NK series,"
+                              " untransformed", "", grid_axis="x")
+    note = (f"; {undefined} markets with a constant NK series (skewness "
+            f"undefined) omitted" if undefined else "")
+    return _save(figure, path, GTD_SOURCE + note, dpi)
+
+
+def fig14_transformation(tsi_table: pd.DataFrame, path: Path,
+                         dpi: int = 300) -> Path:
+    stages = [("NK", "raw NK (fatalities per market-year)"),
+              ("ln_NK", "ln(1 + NK)"),
+              ("z_NK", "z(ln(1 + NK)), pooled")]
+    figure, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+    for axis, (column, label) in zip(axes, stages):
+        values = tsi_table[column].dropna()
+        axis.hist(values, bins=40, color=COLOR_NEUTRAL, zorder=2)
+        axis.text(0.97, 0.95, f"skewness {values.skew():.2f}\n"
+                  f"max {((values.max() - values.mean()) / values.std()):.1f} "
+                  f"SD above mean", transform=axis.transAxes, ha="right",
+                  va="top", fontsize=8.5,
+                  bbox=dict(facecolor="white", edgecolor=COLOR_GRID))
+        _style(axis, "", label, "market-years (count)", grid_axis="y")
+    axes[0].set_title("Figure 14 - Why the transformation is necessary",
+                      loc="left", pad=10)
+    return _save(figure, path, GTD_SOURCE + "; the z-score keeps the log's "
+                 "shape - standardising is linear", dpi)
+
+
+# --------------------------------------------------------------------------
+# 15 TSI heatmap
+# --------------------------------------------------------------------------
+
+def fig15_tsi_heatmap(tsi_table: pd.DataFrame, sample: pd.DataFrame,
+                      path: Path, dpi: int = 300) -> Path:
+    data = _labelled(tsi_table, sample)
+    order = (data.groupby(["group", "country"])["TSI"].mean().reset_index()
+             .assign(g=lambda t: t["group"].map({"developed": 0,
+                                                 "developing": 1}))
+             .sort_values(["g", "TSI"], ascending=[True, False]))
+    matrix = (data.pivot(index="country", columns="year", values="TSI")
+              .reindex(order["country"]))
+    figure, axis = plt.subplots(figsize=(11, max(4, 0.19 * len(matrix) + 2)))
+    image = axis.imshow(matrix.to_numpy(), aspect="auto", cmap="YlOrRd",
+                        interpolation="nearest")
+    axis.set_yticks(range(len(matrix)))
+    axis.set_yticklabels(matrix.index, fontsize=7)
+    _colour_ticklabels(axis, matrix.index, order["group"])
+    years = list(matrix.columns)
+    axis.set_xticks(range(len(years)))
+    axis.set_xticklabels(years, rotation=90, fontsize=8)
+    n_developed = int((order["group"] == "developed").sum())
+    if 0 < n_developed < len(order):
+        axis.axhline(n_developed - 0.5, color=COLOR_TEXT, linewidth=1.5)
+    colorbar = figure.colorbar(image, ax=axis, fraction=0.03, pad=0.02)
+    colorbar.set_label("TSI (standard deviations from the pooled mean)")
+    axis.set_title("Figure 15 - Terrorism Severity Index, market x year "
+                   "(developed above the line)", loc="left", pad=10)
+    return _save(figure, path, GTD_SOURCE + "; TSI of File 3 §7", dpi)
+
+
+# --------------------------------------------------------------------------
+# 16 correlation matrix
+# --------------------------------------------------------------------------
+
+def fig16_correlation_matrix(corr: pd.DataFrame, labels: Dict[str, str],
+                             path: Path, dpi: int = 300) -> Path:
+    names = [labels.get(c, c) for c in corr.columns]
+    values = corr.to_numpy().copy()
+    mask = np.triu(np.ones_like(values, dtype=bool), k=1)
+    values[mask] = np.nan
+    size = max(6, 0.62 * len(names) + 2)
+    figure, axis = plt.subplots(figsize=(size, size * 0.85))
+    image = axis.imshow(values, cmap="RdBu_r", vmin=-1, vmax=1)
+    for i in range(len(names)):
+        for j in range(i + 1):
+            if np.isfinite(values[i, j]):
+                axis.text(j, i, f"{values[i, j]:.2f}", ha="center",
+                          va="center", fontsize=7,
+                          color="white" if abs(values[i, j]) > 0.6
+                          else COLOR_TEXT)
+    axis.set_xticks(range(len(names)))
+    axis.set_xticklabels(names, rotation=45, ha="right", fontsize=8)
+    axis.set_yticks(range(len(names)))
+    axis.set_yticklabels(names, fontsize=8)
+    figure.colorbar(image, ax=axis, fraction=0.04, pad=0.02,
+                    label="Pearson correlation")
+    axis.set_title("Figure 16 - Correlation matrix of the model variables",
+                   loc="left", pad=10)
+    for side in ("top", "right"):
+        axis.spines[side].set_visible(False)
+    return _save(figure, path, "estimation panel (pairwise complete); "
+                 f"{WDI_SOURCE}, UCDP, GTD", dpi)
+
+
+# --------------------------------------------------------------------------
+# 17, 18: the treatment variable by group
+# --------------------------------------------------------------------------
+
+def fig17_components_over_time(tsi_table: pd.DataFrame, sample: pd.DataFrame,
+                               path: Path, dpi: int = 300) -> Path:
+    data = tsi_table.assign(group=tsi_table["iso3"].map(_group_of(sample)))
+    figure, axes = plt.subplots(2, 4, figsize=(14, 6.2), sharex=True,
+                                sharey=True)
+    for row, group in enumerate(GROUPS):
+        chunk = data[data["group"] == group]
+        for col, component in enumerate(COMPONENTS):
+            axis = axes[row, col]
+            yearly = chunk.groupby("year")[f"z_{component}"].mean()
+            axis.plot(yearly.index, yearly.values, color=GROUP_COLORS[group],
+                      linewidth=2)
+            axis.axhline(0, color=COLOR_TEXT, linewidth=0.6)
+            _style(axis, f"{component} - {group}",
+                   "year" if row == 1 else "",
+                   "mean z(ln(1+x)) (SD units)" if col == 0 else "")
+            axis.title.set_fontsize(10)
+    figure.suptitle("Figure 17 - TSI components over time, by group "
+                    "(shared scale)", x=0.01, ha="left", fontweight="bold")
+    return _save(figure, path, GTD_SOURCE + "; NA attacks, NK killed, NI "
+                 "injured, PD property score", dpi)
+
+
+def fig18_tsi_distribution(tsi_table: pd.DataFrame, sample: pd.DataFrame,
+                           path: Path, dpi: int = 300) -> Path:
+    data = tsi_table.assign(group=tsi_table["iso3"].map(_group_of(sample)))
+    bins = np.linspace(data["TSI"].min(), data["TSI"].max(), 36)
+    figure, axis = plt.subplots(figsize=(9.5, 5))
+    floor = data["TSI"].min()
+    for group in GROUPS:
+        values = data.loc[data["group"] == group, "TSI"].dropna()
+        at_floor = (np.isclose(values, floor)).mean() * 100
+        axis.hist(values, bins=bins, density=True, histtype="stepfilled",
+                  alpha=0.35, color=GROUP_COLORS[group], zorder=2)
+        axis.hist(values, bins=bins, density=True, histtype="step",
+                  linewidth=1.8, color=GROUP_COLORS[group], zorder=3,
+                  label=f"{group}: mean {values.mean():+.2f}, "
+                        f"{at_floor:.0f}% with no qualifying event")
+    axis.legend(loc="upper right")
+    _style(axis, "Figure 18 - Distribution of the TSI by group",
+           "TSI (standard deviations from the pooled mean)", "density")
+    return _save(figure, path, GTD_SOURCE, dpi)
+
+
+# --------------------------------------------------------------------------
+# 19 outcomes over time
+# --------------------------------------------------------------------------
+
+def fig19_outcomes_over_time(data: pd.DataFrame, outcomes: Dict[str, object],
+                             path: Path, dpi: int = 300) -> Path:
+    figure, axes = plt.subplots(len(outcomes), 1, figsize=(10, 4 *
+                                                           len(outcomes)),
+                                sharex=True)
+    axes = np.atleast_1d(axes)
+    for axis, (name, spec) in zip(axes, outcomes.items()):
+        for start, end in ((2008, 2009), (2020, 2020)):
+            axis.axvspan(start - 0.5, end + 0.5, color="#eceff3", zorder=0)
+        for group in GROUPS:
+            chunk = data[data["group"] == group].groupby("year")[name]
+            mean, q25, q75 = chunk.mean(), chunk.quantile(0.25), \
+                chunk.quantile(0.75)
+            axis.fill_between(mean.index, q25, q75, alpha=0.18,
+                              color=GROUP_COLORS[group], zorder=1)
+            axis.plot(mean.index, mean.values, "-o", markersize=3,
+                      color=GROUP_COLORS[group], linewidth=2,
+                      label=f"{group}: mean, band = interquartile range")
+        axis.axhline(0, color=COLOR_TEXT, linewidth=0.6)
+        axis.legend(loc="best", fontsize=8)
+        _style(axis, f"{spec.label} ({spec.hypothesis})",
+               "year" if axis is axes[-1] else "", spec.unit)
+    figure.suptitle("Figure 19 - Outcome variables over time (shaded: "
+                    "2008-09 and 2020)", x=0.01, ha="left",
+                    fontweight="bold")
+    return _save(figure, path, f"{WDI_SOURCE} NY.GDP.MKTP.KD.ZG, "
+                 f"BX/BM.KLT.DINV.WD.GD.ZS; sample markets", dpi)
+
+
+# --------------------------------------------------------------------------
+# 20-24: results
+# --------------------------------------------------------------------------
+
+def fig20_21_coefplot(fits: list, label: str, unit: str, number: int,
+                      path: Path, dpi: int = 300) -> Path:
     rows = []
-    for name, result in results.items():
-        if not result.ok or not result.comparison:
-            continue
-        comparison = result.comparison
-        metric_sd = comparison.get("metric_sd", np.nan)
-        terror_sd = comparison.get("terror_sd", np.nan)
-        if not (np.isfinite(metric_sd) and metric_sd > 0):
-            continue
-        scale = terror_sd / metric_sd
-        rows.append({
-            "metric": result.label or name,
-            "beta": comparison["terror_coef"] * scale,
-            "ci_low": comparison["terror_ci_low"] * scale,
-            "ci_high": comparison["terror_ci_high"] * scale,
-            "p": comparison["terror_p"],
-        })
-    if not rows:
-        return None
+    for fit in fits:
+        row = fit.get("TSI")
+        if row is not None:
+            rows.append((fit.title, row["coef"], row["ci_low"],
+                         row["ci_high"], row["p"]))
+    figure, axis = plt.subplots(figsize=(9, 1.3 + 0.8 * len(rows)))
+    for index, (title, coef, low, high, p) in enumerate(rows):
+        color = COLOR_ACCENT if p < 0.05 else COLOR_NEUTRAL
+        axis.errorbar(coef, index, xerr=[[coef - low], [high - coef]],
+                      fmt="o", color=color, capsize=4, markersize=7)
+        axis.annotate(f"{coef:+.3f}", (coef, index), textcoords="offset "
+                      "points", xytext=(0, 9), ha="center", fontsize=8,
+                      color=color)
+    axis.axvline(0, color=COLOR_TEXT, linestyle="--", linewidth=1)
+    axis.set_yticks(range(len(rows)))
+    axis.set_yticklabels([r[0] for r in rows])
+    axis.invert_yaxis()
+    axis.margins(y=0.3)
+    _style(axis, f"Figure {number} - Coefficient on TSI(t), {label}",
+           f"change in {label} ({unit}) per 1 SD of TSI, 95% CI "
+           f"(red = p < 0.05)", "")
+    return _save(figure, path, "regressions of §8.4/§8.5, all countries; "
+                 "country FE in every column", dpi)
 
-    table = pd.DataFrame(rows).sort_values("beta")
-    figure, axis = plt.subplots(figsize=(9, 1.6 + 0.7 * len(table)))
-    positions = np.arange(len(table))
 
-    for index, (_, row) in enumerate(table.iterrows()):
-        significant = np.isfinite(row["p"]) and row["p"] < 0.05
-        color = COLOR_TERROR if significant else "#9aa4ae"
-        axis.errorbar(row["beta"], positions[index],
-                      xerr=[[row["beta"] - row["ci_low"]],
-                            [row["ci_high"] - row["beta"]]],
-                      fmt="o", color=color, capsize=4, markersize=8)
-        axis.annotate(f"{row['beta']:+.3f}" + ("*" if significant else ""),
-                      (row["beta"], positions[index]),
-                      textcoords="offset points", xytext=(0, 11), ha="center",
-                      fontsize=9, color=color)
-
-    axis.axvline(0, color="#22282e", linewidth=1.0, linestyle="--")
-    axis.set_yticks(positions)
-    axis.set_yticklabels(table["metric"])
+def fig22_marginal_effects(effects: pd.DataFrame, labels: Dict[str, str],
+                           path: Path, dpi: int = 300) -> Path:
+    data = effects[(effects["horizon"] == "t")
+                   & effects["group"].isin(GROUPS)].reset_index(drop=True)
+    difference = effects[(effects["horizon"] == "t")
+                         & effects["group"].str.startswith("difference")]
+    figure, axis = plt.subplots(figsize=(9.5, 4.8))
+    ticks = []
+    for index, row in data.iterrows():
+        axis.errorbar(row["coef"], index,
+                      xerr=[[row["coef"] - row["ci_low"]],
+                            [row["ci_high"] - row["coef"]]],
+                      fmt="o", color=GROUP_COLORS[row["group"]], capsize=4,
+                      markersize=8)
+        axis.annotate(f"{row['coef']:+.3f}{row['stars']}",
+                      (row["coef"], index), textcoords="offset points",
+                      xytext=(0, 9), ha="center", fontsize=8,
+                      color=GROUP_COLORS[row["group"]])
+        ticks.append(f"{labels.get(row['outcome'], row['outcome'])}\n"
+                     f"{row['group']}")
+    axis.axvline(0, color=COLOR_TEXT, linestyle="--", linewidth=1)
+    axis.set_yticks(range(len(ticks)))
+    axis.set_yticklabels(ticks, fontsize=9)
+    axis.invert_yaxis()
     axis.margins(y=0.2)
-    _style(axis, "Effect of terrorism across every metric",
-           "standard deviations of the metric per 1 SD of terrorism\n"
-           "(filled red = significant at 5%)")
-    return _save(figure, path, dpi)
+    notes = "; ".join(f"{labels.get(r['outcome'], r['outcome'])}: b3 = "
+                      f"{r['coef']:+.3f} (p = {r['p']:.3f})"
+                      for _, r in difference.iterrows())
+    _style(axis, "Figure 22 - Effect of a 1 SD rise in the TSI, by group",
+           "change in the outcome (percentage points), 95% CI", "")
+    return _save(figure, path, f"regression 4 (§7.3b): developing = b1, "
+                 f"developed = b1 + b3. {notes}", dpi)
 
 
-def terror_overview(country_year: pd.DataFrame, path: Path,
-                    dpi: int = 300) -> Optional[Path]:
-    """Global terrorism over time - context for the paper's opening."""
-    if country_year.empty:
-        return None
-    yearly = country_year.groupby("year")[["n_attacks", "n_killed"]].sum()
+def _residualise(data: pd.DataFrame, column: str,
+                 others: Sequence[str]) -> np.ndarray:
+    formula = f"{column} ~ " + " + ".join(list(others) + ["C(iso3)",
+                                                          "C(year)"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return np.asarray(smf.ols(formula, data=data).fit().resid)
 
-    figure, axis = plt.subplots(figsize=(10, 5))
-    axis.plot(yearly.index, yearly["n_attacks"], "-o", markersize=4,
-              color=COLOR_AFTER, linewidth=2, label="attacks")
-    _style(axis, "Terrorism worldwide, as recorded by the GTD", "year",
-           "attacks per year")
 
-    twin = axis.twinx()
-    twin.plot(yearly.index, yearly["n_killed"], "-", color=COLOR_TERROR,
-              linewidth=2, label="people killed")
-    twin.set_ylabel("people killed per year", color=COLOR_TERROR)
-    twin.tick_params(axis="y", colors=COLOR_TERROR)
-    twin.spines["top"].set_visible(False)
-    twin.grid(False)
+def fig23_binned_scatter(samples: Dict[str, pd.DataFrame],
+                         outcomes: Dict[str, object], controls: List[str],
+                         path: Path, bins: int = 15,
+                         dpi: int = 300) -> Path:
+    """Within each group, the outcome and TSI(t) residualised on TSI(t-1),
+    the controls and both fixed effects (Frisch-Waugh), so the fitted line's
+    slope is that group's split-sample coefficient (regressions 2 and 3)."""
+    figure, axes = plt.subplots(1, len(outcomes), figsize=(6.2 *
+                                                          len(outcomes), 5))
+    axes = np.atleast_1d(axes)
+    for axis, (name, spec) in zip(axes, outcomes.items()):
+        data = samples[name]
+        for group in GROUPS:
+            rows = data[data["group"] == group].reset_index(drop=True)
+            if rows["iso3"].nunique() < 2:
+                continue
+            others = ["TSI_lag1"] + [c for c in controls
+                                     if rows[c].std(ddof=0) > 0]
+            x = _residualise(rows, "TSI", others)
+            y = _residualise(rows, name, others)
+            edges = np.unique(np.quantile(x, np.linspace(0, 1, bins + 1)))
+            which = np.clip(np.digitize(x, edges[1:-1]), 0, len(edges) - 2)
+            means = pd.DataFrame({"x": x, "y": y, "bin": which}).groupby(
+                "bin").mean()
+            axis.scatter(means["x"], means["y"], color=GROUP_COLORS[group],
+                         s=34, zorder=3)
+            slope = np.polyfit(x, y, 1)
+            line = np.linspace(x.min(), x.max(), 50)
+            axis.plot(line, np.polyval(slope, line),
+                      color=GROUP_COLORS[group], linewidth=2,
+                      label=f"{group}: slope {slope[0]:+.3f}")
+        axis.axhline(0, color="#9aa4ae", linewidth=0.8)
+        axis.axvline(0, color="#9aa4ae", linewidth=0.8)
+        axis.legend(loc="best", fontsize=8)
+        _style(axis, f"{spec.label}",
+               "TSI(t), residualised (SD units)",
+               f"{spec.label}, residualised ({spec.unit})")
+    figure.suptitle(f"Figure 23 - Binned scatter ({bins} quantile bins), "
+                    f"TSI against outcome, by group", x=0.01, ha="left",
+                    fontweight="bold")
+    return _save(figure, path, "estimation panel; residuals on TSI(t-1), "
+                 "controls, market and year FE within each group", dpi)
 
-    handles = [plt.Line2D([], [], color=COLOR_AFTER, marker="o"),
-               plt.Line2D([], [], color=COLOR_TERROR)]
-    axis.legend(handles, ["attacks (left)", "people killed (right)"],
-                loc="upper left")
-    return _save(figure, path, dpi)
+
+def fig24_component_coefficients(components: pd.DataFrame,
+                                 labels: Dict[str, str], path: Path,
+                                 dpi: int = 300) -> Path:
+    data = components[(components["horizon"] == "t")
+                      & components["sample"].isin(GROUPS)]
+    outcomes = list(dict.fromkeys(data["outcome"]))
+    figure, axes = plt.subplots(1, len(outcomes), figsize=(6.2 *
+                                                          len(outcomes), 4.8))
+    axes = np.atleast_1d(axes)
+    width = 0.36
+    for axis, outcome in zip(axes, outcomes):
+        chunk = data[data["outcome"] == outcome]
+        for offset, group in zip((-width / 2, width / 2), GROUPS):
+            rows = (chunk[chunk["sample"] == group].set_index("component")
+                    .reindex(COMPONENTS))
+            x = np.arange(len(COMPONENTS)) + offset
+            axis.bar(x, rows["coef"], width=width, color=GROUP_COLORS[group],
+                     label=group, zorder=2)
+            axis.errorbar(x, rows["coef"],
+                          yerr=[rows["coef"] - rows["ci_low"],
+                                rows["ci_high"] - rows["coef"]],
+                          fmt="none", ecolor=COLOR_TEXT, capsize=3, zorder=3)
+        axis.axhline(0, color=COLOR_TEXT, linewidth=0.8)
+        axis.set_xticks(range(len(COMPONENTS)))
+        axis.set_xticklabels([f"{c}\n{COMPONENT_LABELS[c]}"
+                              for c in COMPONENTS], fontsize=8)
+        axis.legend(loc="best", fontsize=8)
+        _style(axis, labels.get(outcome, outcome), "",
+               "coefficient per 1 SD of the component (95% CI)",
+               grid_axis="y")
+    figure.suptitle("Figure 24 - Component coefficients, by group", x=0.01,
+                    ha="left", fontweight="bold")
+    return _save(figure, path, "§8.7 decomposition: z(ln(1+x)) of each "
+                 "component in place of the TSI, split samples", dpi)

@@ -27,7 +27,6 @@ import numpy as np
 import pandas as pd
 
 from . import countries
-from .specs import VariableSpec
 
 COUNTRY_COLUMN_CANDIDATES = (
     "iso3", "iso_3", "iso3c", "iso", "countryiso3code", "country_code",
@@ -171,21 +170,24 @@ def _to_number(series: pd.Series, scale: float = 1.0) -> pd.Series:
 # --------------------------------------------------------------------------
 
 def load_table(path: Path, name: str,
-               spec: Optional[VariableSpec] = None,
+               spec: Optional[object] = None,
                numeric: bool = True) -> pd.DataFrame:
     """Load one data file as DataFrame[iso3, year, <name>].
 
-    `name` becomes the value column name. `spec` supplies explicit column names
-    and the scale; anything left as None on the spec is auto-detected.
-    `numeric=False` keeps the values as text, for categorical classifications
-    such as the World Bank income group.
+    `name` becomes the value column name. `spec` may supply `column`,
+    `country_column`, `year_column` and `scale`; anything absent or None is
+    auto-detected. `numeric=False` keeps the values as text, for categorical
+    classifications such as the World Bank income group.
     """
     path = Path(path)
     raw = read_raw(path)
     columns = list(raw.columns)
     source = path.name
+    value_column = getattr(spec, "column", None)
+    spec_country = getattr(spec, "country_column", None)
+    spec_year = getattr(spec, "year_column", None)
 
-    country_column = (spec.country_column if spec and spec.country_column
+    country_column = (spec_country if spec_country
                       else _pick_column(columns, COUNTRY_COLUMN_CANDIDATES))
     if country_column is None:
         raise DataFileError(
@@ -199,7 +201,7 @@ def load_table(path: Path, name: str,
             f"Available columns: {columns}"
         )
 
-    year_column = spec.year_column if spec and spec.year_column else None
+    year_column = spec_year
     if year_column is None:
         year_column = _pick_column(
             [c for c in columns if c != country_column], YEAR_COLUMN_CANDIDATES
@@ -210,18 +212,18 @@ def load_table(path: Path, name: str,
             f"Available columns: {columns}"
         )
 
-    scale = spec.scale if spec else 1.0
+    scale = getattr(spec, "scale", 1.0)
 
     if year_column is not None:
         table = _load_long(raw, source, country_column, year_column, name,
-                           spec.column if spec else None, scale, numeric)
+                           value_column, scale, numeric)
     else:
         years = _year_columns([c for c in columns if c != country_column])
         if years:
             table = _load_wide(raw, country_column, years, name, scale, numeric)
         else:
             table = _load_constant(raw, source, country_column, name,
-                                   spec.column if spec else None, scale, numeric)
+                                   value_column, scale, numeric)
 
     table["iso3"] = countries.resolve(table["__country__"], source=source)
     unresolved = table["iso3"].isna().sum()
@@ -348,7 +350,7 @@ def _value_candidates(raw, exclude, numeric: bool) -> List[str]:
     return candidates
 
 
-def load_folder(directory: Path, specs: Dict[str, VariableSpec]
+def load_folder(directory: Path, specs: Dict[str, object]
                 ) -> Dict[str, pd.DataFrame]:
     """Load every declared file in a folder. Missing files raise clearly."""
     loaded = {}
@@ -382,6 +384,9 @@ def apply_transform(table: pd.DataFrame, name: str,
             print(f"  note: '{name}' log transform dropped {n_bad} "
                   f"non-positive values")
         table[name] = np.log(values.where(values > 0))
+    elif transform == "log_rate":
+        # ln(1 + x/100) for a rate in per cent; undefined at or below -100%.
+        table[name] = np.log1p(values.where(values > -100) / 100.0)
     elif transform == "log1p":
         table[name] = np.log1p(values.where(values >= 0))
     elif transform == "pct_change":

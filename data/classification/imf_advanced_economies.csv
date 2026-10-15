@@ -1,0 +1,55 @@
+# IMF World Economic Outlook: economies in the "advanced economies" group, and
+# the WEO year each one entered it. Read by File 2 criterion C3, which asks
+# whether a market was advanced at the BASE YEAR (config.BASE_YEAR).
+#
+# The group was created in the May 1997 WEO: the 23 former "industrial
+# countries" plus Israel, Korea, Singapore, Hong Kong SAR and Taiwan Province
+# of China (28 economies). Later entries are listed by the WEO issue that
+# reclassified them.
+#
+# Compiled for this project from the WEO statistical-appendix composition
+# tables. There is no API for historical WEO groupings, so VERIFY this list
+# against the WEO issue of your base year before citing it, and state that
+# vintage in §6.3.
+iso3,country,advanced_since,note
+USA,United States,1997,industrial country before 1997
+JPN,Japan,1997,industrial country before 1997
+DEU,Germany,1997,industrial country before 1997
+FRA,France,1997,industrial country before 1997
+ITA,Italy,1997,industrial country before 1997
+GBR,United Kingdom,1997,industrial country before 1997
+CAN,Canada,1997,industrial country before 1997
+AUS,Australia,1997,industrial country before 1997
+AUT,Austria,1997,industrial country before 1997
+BEL,Belgium,1997,industrial country before 1997
+DNK,Denmark,1997,industrial country before 1997
+FIN,Finland,1997,industrial country before 1997
+GRC,Greece,1997,industrial country before 1997
+ISL,Iceland,1997,industrial country before 1997
+IRL,Ireland,1997,industrial country before 1997
+LUX,Luxembourg,1997,industrial country before 1997
+NLD,Netherlands,1997,industrial country before 1997
+NZL,New Zealand,1997,industrial country before 1997
+NOR,Norway,1997,industrial country before 1997
+PRT,Portugal,1997,industrial country before 1997
+ESP,Spain,1997,industrial country before 1997
+SWE,Sweden,1997,industrial country before 1997
+CHE,Switzerland,1997,industrial country before 1997
+ISR,Israel,1997,added May 1997
+KOR,Korea,1997,added May 1997
+SGP,Singapore,1997,added May 1997
+HKG,Hong Kong SAR,1997,added May 1997
+TWN,Taiwan Province of China,1997,added May 1997
+CYP,Cyprus,2001,verify
+SVN,Slovenia,2007,verify
+MLT,Malta,2008,verify
+CZE,Czech Republic,2009,verify
+SVK,Slovak Republic,2009,verify
+EST,Estonia,2011,verify
+SMR,San Marino,2012,verify
+LVA,Latvia,2014,verify
+LTU,Lithuania,2015,verify
+MAC,Macao SAR,2016,verify
+PRI,Puerto Rico,2016,verify
+AND,Andorra,2021,verify
+HRV,Croatia,2023,verify
